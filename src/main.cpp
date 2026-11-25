@@ -73,30 +73,59 @@ const int GRIPPER_OPEN_ANGLE = 0;        // TUNE
 const int GRIPPER_CLOSED_ANGLE = 90;     // TUNE
 
 // ===================== Tuning =====================
-const int MANUAL_SPEED = 200;
+// These are variables (not const) so they can be changed live over BLE:
+//   "set kp 45"   "get"   - see the PARAMS table below for names.
+// Values set live are lost on reset: copy good ones back here.
+int MANUAL_SPEED = 200;
 
 // PID line following (same values as LineFollowing / DualMode)
-const int   AUTO_BASE_SPEED = 155;       // TUNE
-const int   CORNER_BRAKE = 35;           // speed drop when line is on outer sensors
-const int   LOST_LINE_SPIN = 125;        // pivot speed when the line is lost on a corner
+int   AUTO_BASE_SPEED = 155;             // TUNE
+int   CORNER_BRAKE = 35;                 // speed drop when line is on outer sensors
+int   LOST_LINE_SPIN = 125;              // pivot speed when the line is lost on a corner
 float Kp = 40.0, Ki = 0.0, Kd = 40.0;    // TUNE
 
 // Start: ignore the START box outline for this long after pressing AUTO
-const uint32_t START_GRACE_MS = 700;     // TUNE
+uint32_t START_GRACE_MS = 700;           // TUNE
 
 // Junction (ball branch) detection on the left side
-const int      JUNCTION_CONFIRM_READS = 2;    // consecutive loops the pattern must be seen
-const uint32_t JUNCTION_MIN_GAP_MS = 350;     // TUNE: min time between two branches
+int      JUNCTION_CONFIRM_READS = 2;     // consecutive loops the pattern must be seen
+uint32_t JUNCTION_MIN_GAP_MS = 350;      // TUNE: min time between two branches
 
 // Turning into the branch
-const int      TURN_FORWARD_SPEED = 130;
-const uint32_t TURN_FORWARD_MS = 180;    // TUNE: drive on so the wheels sit over the junction
-const int      TURN_SPIN_SPEED = 130;    // TUNE
-const uint32_t TURN_MIN_SPIN_MS = 150;   // ignore sensors for the first part of the spin
-const uint32_t TURN_TIMEOUT_MS = 2500;   // give up and go manual if the branch isn't found
+int      TURN_FORWARD_SPEED = 130;
+uint32_t TURN_FORWARD_MS = 180;          // TUNE: drive on so the wheels sit over the junction
+int      TURN_SPIN_SPEED = 130;          // TUNE
+uint32_t TURN_MIN_SPIN_MS = 150;         // ignore sensors for the first part of the spin
+uint32_t TURN_TIMEOUT_MS = 2500;         // give up and go manual if the branch isn't found
 
 // Colour card
-const int COLOR_CONFIRM_READS = 3;       // same colour this many reads in a row = locked
+int COLOR_CONFIRM_READS = 3;             // same colour this many reads in a row = locked
+
+// Live-tunable parameter table (name used in "set <name> <value>")
+struct Param { const char* name; char type; void* ptr; };   // type: f=float i=int u=uint32
+const Param PARAMS[] = {
+  {"speed",   'i', &AUTO_BASE_SPEED},
+  {"kp",      'f', &Kp},
+  {"ki",      'f', &Ki},
+  {"kd",      'f', &Kd},
+  {"brake",   'i', &CORNER_BRAKE},
+  {"lostspin",'i', &LOST_LINE_SPIN},
+  {"grace",   'u', &START_GRACE_MS},
+  {"jreads",  'i', &JUNCTION_CONFIRM_READS},
+  {"jgap",    'u', &JUNCTION_MIN_GAP_MS},
+  {"fwdspd",  'i', &TURN_FORWARD_SPEED},
+  {"fwdms",   'u', &TURN_FORWARD_MS},
+  {"turnspd", 'i', &TURN_SPIN_SPEED},
+  {"turnmin", 'u', &TURN_MIN_SPIN_MS},
+  {"turnto",  'u', &TURN_TIMEOUT_MS},
+  {"creads",  'i', &COLOR_CONFIRM_READS},
+  {"manual",  'i', &MANUAL_SPEED},
+};
+const int NUM_PARAMS = sizeof(PARAMS) / sizeof(PARAMS[0]);
+
+// Telemetry (off by default; "tel on", "tel 20" = 20 Hz, "tel off")
+bool     telemetryOn = false;
+uint32_t telemetryPeriodMs = 50;
 
 // Behaviour switches
 const bool AUTO_CLOSE_GRIPPER_ON_ARRIVAL = false;
@@ -113,8 +142,21 @@ AutoPhase phase = PH_IDLE;
 volatile int  manualLeft = 0, manualRight = 0;
 volatile bool reqManual = false, reqAuto = false;
 volatile bool reqGripperToggle = false, reqCycleTarget = false;
-volatile bool deviceConnected = false;
+volatile bool deviceConnected = false;    // true while at least one device is connected
+volatile int  connectedCount = 0;         // phone + PC logger can both be connected
 volatile bool reqDisconnectStop = false;
+
+// Text command from BLE (e.g. "set kp 45"), handed to loop() to execute
+char          cmdBuf[64];
+volatile bool cmdPending = false;
+
+// Last values, for telemetry
+int   lastLeftCmd = 0, lastRightCmd = 0;
+float lastError = 0, lastPid = 0;
+int   lastIrBits = 0;
+uint16_t  lastColorC = 0;
+CardColor lastColorClass = COLOR_NONE;
+uint32_t  lastTelemetryMs = 0;
 
 // Auto-run state (loop() only)
 float previousError = 0, integral = 0;
@@ -151,6 +193,8 @@ bool lastShownConnected = false;
 BLEServer* pServer = nullptr;
 BLECharacteristic* pTxCharacteristic = nullptr;
 
+void sendParams();   // defined in the "Text commands & telemetry" section
+
 // ===================== Helpers =====================
 int ballForColor(CardColor c) {
   switch (c) {
@@ -165,21 +209,33 @@ int currentTarget() {
   return targetOverride > 0 ? targetOverride : ballForColor(detectedColor);
 }
 
+// Send one line to every connected BLE device (and USB serial).
+// Keep lines short: phones with the default MTU only get the first 20 bytes.
+void bleSend(const char* line) {
+  Serial.println(line);
+  if (deviceConnected && pTxCharacteristic) {
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "%s\n", line);
+    pTxCharacteristic->setValue((uint8_t*)buf, min(n, (int)sizeof(buf) - 1));
+    pTxCharacteristic->notify();
+  }
+}
+
+// Event line: shown on the OLED and sent as "E,<msg>"
 void setStatus(const char* msg) {
   strncpy(statusMsg, msg, sizeof(statusMsg) - 1);
   statusMsg[sizeof(statusMsg) - 1] = '\0';
   displayDirty = true;
-  Serial.println(msg);
-  if (deviceConnected && pTxCharacteristic) {
-    String line = String(msg) + "\n";
-    pTxCharacteristic->setValue((uint8_t*)line.c_str(), line.length());
-    pTxCharacteristic->notify();
-  }
+  char line[48];
+  snprintf(line, sizeof(line), "E,%lu,%s", (unsigned long)millis(), msg);
+  bleSend(line);
 }
 
 void setMotors(int leftSpeed, int rightSpeed) {
   leftSpeed = constrain(leftSpeed, -255, 255);
   rightSpeed = constrain(rightSpeed, -255, 255);
+  lastLeftCmd = leftSpeed;
+  lastRightCmd = rightSpeed;
 
   if (leftSpeed >= 0) { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
   else { digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); leftSpeed = -leftSpeed; }
@@ -251,6 +307,7 @@ IRState readIR() {
   ir.s4 = !digitalRead(IR4);
   ir.s5 = !digitalRead(IR5);
   ir.active = ir.s1 + ir.s2 + ir.s3 + ir.s4 + ir.s5;
+  lastIrBits = (ir.s1 << 4) | (ir.s2 << 3) | (ir.s3 << 2) | (ir.s4 << 1) | ir.s5;
   return ir;
 }
 
@@ -258,6 +315,8 @@ void pollColor() {
   if (!colorSensorOk || detectedColor != COLOR_NONE) return;
   ColorReading rd;
   if (!colorSensorRead(rd)) return;
+  lastColorC = rd.c;
+  lastColorClass = rd.color;
 
   if (rd.color != COLOR_NONE && rd.color == colorCandidate) {
     colorCandidateReads++;
@@ -279,6 +338,8 @@ void pollLiveColor() {
   if (!colorSensorOk) return;
   ColorReading rd;
   if (!colorSensorRead(rd)) return;
+  lastColorC = rd.c;
+  lastColorClass = rd.color;
 
   if (rd.color == liveCandidate) liveCandidateReads++;
   else { liveCandidate = rd.color; liveCandidateReads = 1; }
@@ -311,6 +372,8 @@ void followLine(const IRState& ir, bool straightThrough) {
   float D = error - previousError;
   float pid = Kp * error + Ki * integral + Kd * D;
   previousError = error;
+  lastError = error;
+  lastPid = pid;
 
   int base = AUTO_BASE_SPEED;
   if (error <= -1.0 || error >= 1.0) base -= CORNER_BRAKE;
@@ -339,6 +402,7 @@ void startAutoRun() {
   autoStartMs = millis();
   enterPhase(PH_TO_BRANCH);
   setStatus(targetOverride ? "AUTO (forced target)" : "AUTO: reading colour");
+  sendParams();                        // log the settings used for this run
 }
 
 // Stop and hand control back to the user
@@ -447,14 +511,19 @@ void autoStep() {
 // These only set flags; loop() does the actual work so the two cores
 // never touch the motors / I2C at the same time.
 class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer*) override {
+  void onConnect(BLEServer* s) override {
+    connectedCount = connectedCount + 1;
     deviceConnected = true;
+    if (connectedCount < 3) s->startAdvertising();   // let a 2nd device (PC logger) join
   }
   void onDisconnect(BLEServer* s) override {
-    deviceConnected = false;
-    manualLeft = 0;
-    manualRight = 0;
-    reqDisconnectStop = true;
+    connectedCount = max(0, connectedCount - 1);
+    deviceConnected = connectedCount > 0;
+    if (connectedCount == 0) {         // last link gone: stop for safety
+      manualLeft = 0;
+      manualRight = 0;
+      reqDisconnectStop = true;
+    }
     s->startAdvertising();
   }
 };
@@ -486,24 +555,136 @@ class RxCallbacks : public BLECharacteristicCallbacks {
         case '8': manualLeft =  MANUAL_SPEED; manualRight = -MANUAL_SPEED; break;  // right
       }
     }
-    // Plain UART terminal fallback: F B L R S, A = auto, M = manual, G = gripper
-    else if (len > 0) {
-      switch ((char)d[0]) {
-        case 'F': manualLeft =  MANUAL_SPEED; manualRight =  MANUAL_SPEED; break;
-        case 'B': manualLeft = -MANUAL_SPEED; manualRight = -MANUAL_SPEED; break;
-        case 'L': manualLeft = -MANUAL_SPEED; manualRight =  MANUAL_SPEED; break;
-        case 'R': manualLeft =  MANUAL_SPEED; manualRight = -MANUAL_SPEED; break;
-        case 'S': manualLeft = 0; manualRight = 0; break;
-        case 'A': reqAuto = true; break;
-        case 'M': reqManual = true; break;
-        case 'G': reqGripperToggle = true; break;
-      }
+    // Text line from a UART terminal or the PC logger - executed in loop()
+    else if (len > 0 && !cmdPending) {
+      size_t n = min(len, sizeof(cmdBuf) - 1);
+      memcpy(cmdBuf, d, n);
+      while (n > 0 && (cmdBuf[n - 1] == '\n' || cmdBuf[n - 1] == '\r' || cmdBuf[n - 1] == ' ')) n--;
+      cmdBuf[n] = '\0';
+      cmdPending = true;
     }
   }
 };
 
+// ===================== Text commands & telemetry =====================
+// Commands (UART screen of the app, or tools/robot_link.py on a PC):
+//   F B L R S        drive forward/back/left/right/stop (manual)
+//   A / M / G        start auto run / manual / toggle gripper
+//   force <0-3>      target override (0 = use colour)
+//   set <name> <v>   change a tuning value, e.g. "set kp 45"
+//   get              list all tuning values  ("P,name=value,...")
+//   tel on|off|<hz>  telemetry stream, default 20 Hz
+//   ping             replies "E,...,pong"
+//
+// Telemetry line (one per period):
+//   T,ms,phase,ir,err,pid,L,R,branches,target,see,locked,C
+//   phase: 0 manual/idle 1 to-branch 2 turn-fwd 3 turn-spin 4 to-ball
+//   ir: 5 bits left->right (1 = black)   see/locked: N R G B   C: clear count
+char colorChar(CardColor c) {
+  switch (c) { case COLOR_RED: return 'R'; case COLOR_GREEN: return 'G'; case COLOR_BLUE: return 'B'; default: return 'N'; }
+}
+
+void sendParams() {
+  char line[110];
+  int n = snprintf(line, sizeof(line), "P");
+  for (int i = 0; i < NUM_PARAMS; i++) {
+    char item[24];
+    const Param& p = PARAMS[i];
+    if (p.type == 'f')      snprintf(item, sizeof(item), ",%s=%.2f", p.name, *(float*)p.ptr);
+    else if (p.type == 'i') snprintf(item, sizeof(item), ",%s=%d", p.name, *(int*)p.ptr);
+    else                    snprintf(item, sizeof(item), ",%s=%lu", p.name, (unsigned long)*(uint32_t*)p.ptr);
+    if (n + strlen(item) >= sizeof(line) - 1) { bleSend(line); n = snprintf(line, sizeof(line), "P"); }
+    n += snprintf(line + n, sizeof(line) - n, "%s", item);
+  }
+  if (n > 1) bleSend(line);
+}
+
+bool setParam(const char* name, const char* value) {
+  for (int i = 0; i < NUM_PARAMS; i++) {
+    const Param& p = PARAMS[i];
+    if (strcasecmp(p.name, name) != 0) continue;
+    if (p.type == 'f')      *(float*)p.ptr = atof(value);
+    else if (p.type == 'i') *(int*)p.ptr = atoi(value);
+    else                    *(uint32_t*)p.ptr = (uint32_t)strtoul(value, nullptr, 10);
+    return true;
+  }
+  return false;
+}
+
+void sendTelemetry() {
+  char line[96];
+  char ir[6];
+  for (int i = 0; i < 5; i++) ir[i] = (lastIrBits & (1 << (4 - i))) ? '1' : '0';
+  ir[5] = '\0';
+  snprintf(line, sizeof(line), "T,%lu,%d,%s,%.2f,%.0f,%d,%d,%d,%d,%c,%c,%u",
+           (unsigned long)millis(), mode == MODE_AUTO ? (int)phase : 0, ir,
+           lastError, lastPid, lastLeftCmd, lastRightCmd,
+           junctionsPassed, currentTarget(),
+           colorChar(lastColorClass), colorChar(detectedColor), lastColorC);
+  bleSend(line);
+}
+
+void handleTextCommand(char* cmd) {
+  char msg[40];
+
+  // Single-letter drive commands (case-sensitive, kept from ManualControl)
+  if (strlen(cmd) == 1) {
+    switch (cmd[0]) {
+      case 'F': manualLeft =  MANUAL_SPEED; manualRight =  MANUAL_SPEED; return;
+      case 'B': manualLeft = -MANUAL_SPEED; manualRight = -MANUAL_SPEED; return;
+      case 'L': manualLeft = -MANUAL_SPEED; manualRight =  MANUAL_SPEED; return;
+      case 'R': manualLeft =  MANUAL_SPEED; manualRight = -MANUAL_SPEED; return;
+      case 'S': manualLeft = 0; manualRight = 0; return;
+      case 'A': reqAuto = true; return;
+      case 'M': reqManual = true; return;
+      case 'G': reqGripperToggle = true; return;
+    }
+  }
+
+  char* word = strtok(cmd, " ");
+  if (!word) return;
+  char* arg1 = strtok(nullptr, " ");
+  char* arg2 = strtok(nullptr, " ");
+
+  if (!strcasecmp(word, "ping")) {
+    setStatus("pong");
+  } else if (!strcasecmp(word, "stop")) {
+    if (mode == MODE_AUTO) endAutoRun("Stopped by command");
+    manualLeft = 0; manualRight = 0;
+  } else if (!strcasecmp(word, "get")) {
+    sendParams();
+  } else if (!strcasecmp(word, "set") && arg1 && arg2) {
+    if (setParam(arg1, arg2)) { snprintf(msg, sizeof(msg), "set %s=%s", arg1, arg2); setStatus(msg); }
+    else { snprintf(msg, sizeof(msg), "unknown param %s", arg1); setStatus(msg); }
+  } else if (!strcasecmp(word, "force") && arg1) {
+    targetOverride = constrain(atoi(arg1), 0, 3);
+    snprintf(msg, sizeof(msg), "force target %d", targetOverride);
+    setStatus(msg);
+  } else if (!strcasecmp(word, "tel")) {
+    if (!arg1 || !strcasecmp(arg1, "on")) telemetryOn = true;
+    else if (!strcasecmp(arg1, "off")) telemetryOn = false;
+    else {
+      int hz = constrain(atoi(arg1), 1, 50);
+      telemetryPeriodMs = 1000 / hz;
+      telemetryOn = true;
+    }
+    snprintf(msg, sizeof(msg), "telemetry %s %luHz", telemetryOn ? "on" : "off",
+             (unsigned long)(1000 / telemetryPeriodMs));
+    setStatus(msg);
+  } else {
+    snprintf(msg, sizeof(msg), "unknown cmd %.20s", word);
+    setStatus(msg);
+  }
+}
+
 // ===================== Setup / loop =====================
 void handleRequests() {
+  if (cmdPending) {
+    char cmd[sizeof(cmdBuf)];
+    memcpy(cmd, cmdBuf, sizeof(cmd));
+    cmdPending = false;
+    handleTextCommand(cmd);
+  }
   if (reqDisconnectStop) {
     reqDisconnectStop = false;
     if (mode == MODE_AUTO && ABORT_AUTO_ON_DISCONNECT) endAutoRun("BLE lost - stopped");
@@ -569,6 +750,7 @@ void setup() {
   setMotors(0, 0);
 
   BLEDevice::init("ESP32-S3-Robot");
+  BLEDevice::setMTU(247);              // allow long telemetry lines (peer decides final size)
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
   BLEService* svc = pServer->createService(SERVICE_UUID);
@@ -590,6 +772,11 @@ void loop() {
   } else {
     setMotors(manualLeft, manualRight);
     pollLiveColor();
+  }
+
+  if (telemetryOn && millis() - lastTelemetryMs >= telemetryPeriodMs) {
+    lastTelemetryMs = millis();
+    sendTelemetry();
   }
 
   if (displayDirty) {
