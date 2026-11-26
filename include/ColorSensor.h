@@ -1,9 +1,9 @@
 // =====================================================================
 //  ColorSensor.h  -  Minimal non-blocking TCS34725 driver + colour classifier
 //
-//  Identical copy lives in RGBSensorTest/ and DeliveryRobot/ so the
-//  calibration values you measure in the test project work unchanged
-//  on the robot. If you change one, copy it to the other.
+//  A copy lives in RGBSensorTest/ as well. The DeliveryRobot copy makes
+//  COLOR_REFS and the match distance changeable at runtime (live calibration
+//  with tools/calibrate_color.py); the reference values are the same.
 //
 //  Wiring (own I2C bus "Wire1", separate from the OLED on GPIO 11/12):
 //    TCS34725 VIN -> 3V3        GND -> GND
@@ -52,7 +52,9 @@ inline const char* colorName(CardColor c) {
 // "clear" is the raw C value - used to reject very dark surfaces.
 struct ColorRef { CardColor color; float r, g, b; const char* label; };
 
-static const ColorRef COLOR_REFS[] = {
+// Not const: DeliveryRobot can change these live over BLE ("cref RED 71.7 16.1 12.6")
+// so a calibration can be tried without reflashing (tools/calibrate_color.py).
+static ColorRef COLOR_REFS[] = {
   //  class         r%    g%    b%    label
   { COLOR_RED,     71.7, 16.1, 12.6, "RED"   },  // MEASURED @2cm 16x/50ms (C~1230), 26/26 reads
   { COLOR_GREEN,   39.1, 35.6, 19.2, "GREEN" },  // MEASURED @2cm 16x/50ms (C~2155) - only ~4.6 from WHITE!
@@ -66,6 +68,7 @@ static const int NUM_COLOR_REFS = sizeof(COLOR_REFS) / sizeof(COLOR_REFS[0]);
 #define COLOR_MIN_CLEAR     150
 // If the best match is further than this (in % units), treat as unknown
 #define COLOR_MAX_DISTANCE  12.0f
+static float colorMaxDistance = COLOR_MAX_DISTANCE;   // live: "set cdist <v>" in DeliveryRobot
 
 // ---------------- Data ----------------
 struct ColorReading {
@@ -136,7 +139,7 @@ inline void classifyColor(ColorReading& rd) {
     float d = sqrtf(dr * dr + dg * dg + db * db);
     if (d < rd.distance) { rd.distance = d; rd.refIndex = i; }
   }
-  if (rd.refIndex >= 0 && rd.distance <= COLOR_MAX_DISTANCE) {
+  if (rd.refIndex >= 0 && rd.distance <= colorMaxDistance) {
     rd.color = COLOR_REFS[rd.refIndex].color;
   }
 }

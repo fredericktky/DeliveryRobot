@@ -4,7 +4,7 @@ ESP32-S3 firmware for a dual-mode delivery robot: the basic task of AIROST IoT P
 
 The robot follows a black line with PID control and reads a colour card with a TCS34725 sensor (**red → ball 1, blue → ball 2, green → ball 3**). It counts the ball branches, turns into the right one, stops at the ball, and then switches itself to manual so you can grip the ball and drive it back.
 
-**Testing, flashing and tuning on the track:** see [TESTING.md](TESTING.md) for the IR sensor layout, the reliable flash procedure, live telemetry, the test ladder and the debugging history.
+**Testing, flashing and tuning on the track:** see [TESTING.md](TESTING.md) for the IR sensor layout, the reliable flash procedure, live telemetry, the test ladder and the debugging history. For a timed lab session use [LAB_PLAN.md](LAB_PLAN.md) and `tools/lab_test.py`.
 
 ## Hardware
 

@@ -4,8 +4,9 @@ How we test and tune the robot on the track with live Bluetooth telemetry, what 
 Written so another person or coding agent can pick up the work without the original chat.
 
 **Status (2026-11-26):** basic task on the **advanced map** reaches the right ball for `force 1`, `force 2` and `force 3` (all confirmed on the track).
-The gripper holds a ball at 0° / 90° and closes on arrival by default (`gauto 1`; the default in `main.cpp` is set but
-**not flashed yet**, it was only set live). Next: a real ball and colour card, then full basic runs. See [Next steps](#10-next-steps).
+The gripper holds a ball at 0° / 90° and closes on arrival by default (`gauto 1`).
+The **advanced task (mode 2)** and the button-4 run-mode switch are written and build, but are **not tested on the
+track yet** (tests 12–16). Colour cards are not tested yet either (no colour paper). See [Next steps](#10-next-steps).
 
 ---
 
@@ -125,7 +126,10 @@ Logs are written to `DeliveryRobot/logs/<date-time>.log` (git-ignored), one line
 
 ### Message types
 * `T,ms,phase,ir,err,pid,L,R,branches,target,see,locked,C` – telemetry
-  * `phase`: 0 idle/manual · 1 to branch · 2 turn forward · 3 turn spin · 4 to ball
+  * `phase`: 0 idle/manual · 1 to branch · 2 turn forward · 3 turn spin · 4 to ball ·
+    5 grab/release wait · 6 reverse to the T · 7 to station · 8 station branch · 9 to base
+* `K,ms,c,r%,g%,b%,label,dist` – raw colour reading (only after `craw on`)
+* `R,label,r,g,b` – a colour reference (reply to `cref`)
   * `ir`: 5 bits IR1..IR5 · `L`,`R`: motor commands (−255..255) · `branches`: ball branches counted
 * `E,ms,text` – events: `Corner 1`, `Branch 1 of 2`, `On branch`, `ARRIVED ball 2`, `Line lost`, ...
 * `P,name=value,...` – parameters (sent on `get` and at every auto start)
@@ -147,9 +151,17 @@ Telemetry is 20 Hz but the control loop runs every ~5 ms, so short patterns can 
 
 ## 5. Commands and live parameters
 
+Phone control pad: **1** manual · **2** auto · **3** gripper · **4** run mode
+(cycles `mode` 0 → 1 → 2 in manual; the OLED shows it top right: `BASIC`/`ADVANCED` and `basic map`/`adv map`).
+
 Commands (BLE text): `A` auto · `M` manual/stop auto · `F B L R S` drive · `G` toggle gripper ·
-`force 0..3` target ball (0 = use colour card) · `grip open|close|<deg>` · `set <name> <v>` · `get` ·
-`tel on|off|<hz>` · `ping` · `stop`.
+`force 0..3` target ball (0 = use colour card) · `adv <ball> <station> <base>` force all advanced targets
+(`adv 0 0 0` = use the cards; it also sets the ball for basic runs) · `grip open|close|<deg>` · `set <name> <v>` · `get` ·
+`tel on|off|<hz>` · `ping` · `stop` ·
+`craw on|off` raw colour stream · `cref` / `cref <RED|GREEN|BLUE|WHITE|BLACK> r g b` show / set a colour reference live ·
+`auto ball|station|stend` start the advanced task part-way (mode 2, after `adv`): `ball` = on a ball branch facing
+the end bar · `station` = on the vertical line heading north below station 3, ball held · `stend` = on a station
+branch facing its end bar, ball held.
 
 Live values are lost on reset. Copy good values into the tuning block at the top of `src/main.cpp`.
 
@@ -165,11 +177,22 @@ Live values are lost on reset. Copy good values into the tuning block at the top
 | `cornreads` | 3 | IR4+IR5 must both be black this many loops (noise filter) |
 | `grace` | 700 | ms after start where the box outline is ignored (no pivots) |
 | `jreads` / `jgap` | 2 / 350 | ball-branch confirm loops / min ms between branches |
-| `map` | 1 | 0 basic map (count all left branches) · 1 advanced (count after `corners` corners) |
+| `mode` | 1 | 0 basic task, basic map · 1 basic task, advanced map (stations skipped) · 2 advanced task |
 | `corners` / `cgap` | 2 / 1000 | right corners before ball branches / min ms between corners |
 | `fwdspd` / `fwdms` | 130 / 180 | turn-in: forward speed / time before pivoting into the branch |
 | `turnspd` / `turnmin` / `turnto` | 170 / 150 / 2500 | turn-in pivot speed / ignore sensors first ms / give up |
 | `creads` | 3 | colour must match this many reads to lock |
+| `cardmax` | 3000 | clear count below this = a card (white ~4000, cards 1200–2200); 0 = off |
+| `cwhite` | 2 | white reads needed between two cards (advanced: 3 cards in a row) |
+| `grabms` | 400 | wait after the gripper closes / opens |
+| `backspd` | 135 | reverse speed back along a branch to the T |
+| `bback` / `sback` | 250 / 250 | while reversing from the ball / station, ignore the end bar for this long |
+| `tfwdms` | 220 | after reversing onto the T, drive forward this long before the 90° turn (wheels over the line) |
+| `backto` | 3000 | give up (`Back timeout`) if the T isn't reached while reversing (realign time not counted) |
+| `rkp` | 25 | reversing: PWM difference toward the line when IR3/IR4 sees it (0 = straight) |
+| `realto` | 1000 | reversing: an edge sensor saw the line → pivot in place until IR3/IR4 has it; give up after this (`Reverse lost line`) |
+| `cdist` | 12.0 | colour match distance (r/g/b % units); set by `calibrate_color.py` |
+| `treads` | 2 | T junction (line on both sides) confirm loops |
 | `manual` | 200 | manual driving PWM |
 | `gopen` / `gclose` | 0 / 90 | gripper servo angles (servo moves when set) |
 | `gauto` | 1 | close the gripper automatically on `ARRIVED` (0 = leave it open) |
@@ -189,7 +212,33 @@ Live values are lost on reset. Copy good values into the tuning block at the top
 6. **Start:** for `grace` ms, steer on inner sensors only or go straight; no pivots (the box edge looks like a corner).
 7. **Turn-in:** at the target branch drive `fwdms` at `fwdspd`, pivot left at `turnspd` until IR3 finds the branch
    (only after IR1/IR2 saw it sweep in from the left, so the main line can't end the turn), follow it,
-   stop when ≥4 sensors are black (crossbar) → `ARRIVED ball n` → manual mode.
+   stop when ≥4 sensors are black (crossbar) → `ARRIVED ball n` → gripper closes (`gauto`) → manual mode.
+   A right turn-in (stations) is the mirror: IR5 first, then IR4.
+8. **Sides per leg:** `cornerSide` says which side is a corner on the current leg (turn that way) and which side
+   is a branch (cross it straight). Outbound: corners right, branches left. The patterns are the same on both sides:
+   left = IR2 with IR1/IR3, right = IR4+IR5.
+9. **Colour cards:** read only after the start grace (the box edge once read as RED) and only while the clear count
+   is in the card range (`cardmax`), so white isn't read as green. Basic locks the first card; advanced records
+   3 cards, each after `cwhite` white reads.
+
+### Advanced task route (mode 2)
+| Leg | Phase | Corners / branches on this leg |
+|---|---|---|
+| Out to the ball (reads 3 cards before corner 1) | 1 → 2 → 3 → 4 | right corners, left branches; ball branches counted after 2 corners |
+| Grab, reverse straight up the ball branch (end bar ignored for `bback`) until the T (black on both sides) | 5 → 6 | – |
+| Forward `tfwdms`, pivot **left** (still facing into the branch, so left = east) | 2 → 3 | – |
+| East (cross the other ball branches on the right), **left** corner 2, north: count stations on the **right** (station 3 first), turn right in | 7 → 2 → 3 → 8 | left corners, right branches |
+| Release, reverse to the vertical line (`sback`), forward `tfwdms`, 90° turn | 5 → 6 → 2 → 3 | – |
+| Base 1: turn **left** (north), left corner 1, stop on the box edge | 9 | left corners, right branches |
+| Base 2: turn **right** (south), right corner 2, stop on the box edge | 9 | right corners, left branches |
+
+While reversing the IR bar **trails** the wheels, and strong steering on a trailing sensor makes the robot snake.
+So the reverse uses a gentle correction on the inner sensors (`rkp`) and, when an edge sensor sees the line, stops
+and pivots in place back onto it (`Reverse: realign L/R` events; no travel while pivoting, so no snaking).
+If it snakes while reversing, lower `rkp` (0 = straight back, realign only).
+
+Card meaning: card 1 = ball (R1 B2 G3) · card 2 = station (R1 B2 G3) · card 3 = base (R1 B2; green stops the run).
+The run stops with `Cards: n read, need 3` if a target is still missing at corner 1.
 
 ---
 
@@ -208,6 +257,14 @@ Live values are lost on reset. Copy good values into the tuning block at the top
 | 9 | Colour card | `force 0`, card on colour square 1 | `Colour RED -> B1` etc. in the log | ⬜ |
 | 10 | Full basic run | `force 0`, each colour | correct ball each time, 3 runs in a row | ⬜ |
 | 11 | Save values | copy live values into `src/main.cpp`, commit | | ⬜ |
+| 12 | Mode button | button 4 three times in manual | OLED cycles BASIC/basic map → BASIC/adv map → ADVANCED | ⬜ |
+| 13 | Advanced leg: ball | `auto ball` (on the ball 1 branch) | `Got ball 1`, `T: turn left`, `To station` | ⬜ |
+| 14 | Advanced leg: station | `auto station` (below station 3, heading north) | `Station pass`, `Placed at station n`, `T: turn …`, `To base` | ⬜ |
+| 15 | Advanced full runs | `adv 1 3 1` and `adv 3 1 2` from START | `DONE base 1` / `DONE base 2` | ⬜ |
+| 16 | Advanced with cards | `adv 0 0 0`, 3 cards on the squares | `Card 1..3` events, right ball/station/base | ⬜ |
+
+`tools/lab_test.py` runs all of these with recording; `LAB_PLAN.md` is the 1-hour schedule.
+Test the advanced legs on their own first (`auto <leg>`), tune `bback`, `tfwdms`, `sback`, `fwdms`, then do full runs.
 
 Repeat 4–6 after any change to `followLine`.
 
@@ -248,10 +305,19 @@ Timings drift with battery level and the paper surface, so any timing windows mu
 * **Timing windows / confidence:** the route order is fixed and the timings are repeatable (table above).
   Use the time from leaving the box to corner 1 to estimate speed, then accept a feature only inside its expected
   window, accept weaker evidence inside it, and stop with e.g. `Missed corner 1` if a window passes with nothing.
-* **Advanced task:** read all 3 colour cards (ball / station / base), pick up automatically, back out of the branch,
-  left corners on the way back, place at the station, finish in base 1 or 2.
+* The advanced task is written (mode 2) but **not yet tested on the track**; see tests 12–16 and `LAB_PLAN.md`.
 
-## 10. Next steps
+## 10. Tools
+
+| Tool | Use |
+|---|---|
+| `tools/robot_link.py` | one-off commands and recordings from the command line |
+| `tools/lab_test.py` | the guided lab test plan: instructions, recording, auto-stop, pass/fail, notes, `logs/lab/<session>/SUMMARY.md` |
+| `tools/calibrate_color.py` | guided colour calibration; `--push` (live), `--apply` (write the source), `--verify`, `--analyse` |
+| `tools/log_summary.py` | readable timeline of any log (`--all` for every IR change) |
+| `tools/rlink.py` | shared BLE code used by the two tools above |
+
+## 11. Next steps
 
 1. The gripper now closes on `ARRIVED` by default (`gauto 1`). Not yet tested with a real ball on the ring:
    check the ball ends up inside the gripper; if not, add a short reverse/forward move at the stop.

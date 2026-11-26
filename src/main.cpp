@@ -1,30 +1,32 @@
 // =====================================================================
-//  DeliveryRobot - AIROST Project 1, basic task (Figure 1 map)
+//  DeliveryRobot - AIROST Project 1 (basic and advanced task)
 //
-//  Run:
-//   1. Start on the line leaving the START box, press button 2 (AUTO).
-//   2. PID line following along the top line (dashed section included).
-//   3. TCS34725 reads the colour card beside the line:
-//        RED -> ball 1   BLUE -> ball 2   GREEN -> ball 3
-//   4. After the two right-hand corners the robot drives along the bottom
-//      line and counts the ball branches on its LEFT side
-//      (ball 1 is reached first, then ball 2, then ball 3).
-//   5. At the chosen branch it turns left, follows the stub, and stops on
-//      the end bar (all sensors black).
-//   6. On arrival it switches itself to MANUAL so you can grip the ball
-//      (button 3) and drive it back to "unload ball".
+//  Run modes (phone button 4 cycles them in manual mode, shown on the OLED):
+//   0 BASIC on the basic map (Figure 1)
+//   1 BASIC on the advanced map (Figure 2): station branches are skipped
+//   2 ADVANCED task on the advanced map
+//
+//  Basic task: read one colour card (RED -> ball 1, BLUE -> 2, GREEN -> 3),
+//  take both right corners, count the ball branches on the LEFT, turn in,
+//  stop on the end bar, close the gripper and switch to MANUAL.
+//
+//  Advanced task: read 3 cards on the way out
+//     card 1 = ball (R1 B2 G3)   card 2 = station (R1 B2 G3)   card 3 = base (R1 B2)
+//  ball: turn in, grab, reverse back to the T, turn left (east), cross the
+//  other ball branches, LEFT corner, count stations from the bottom (on the
+//  RIGHT), turn in, release, reverse back to the T, then
+//     base 1: turn left (north), left corner, stop on the base 1 box edge
+//     base 2: turn right (south), right corner, stop on the base 2 box edge
+//  Testing without cards: "adv <ball> <station> <base>" forces all three.
 //
 //  Phone (Adafruit Bluefruit Connect -> Controller -> Control Pad):
 //   Arrows : drive (manual mode, hold)
 //   1      : MANUAL (also aborts an auto run)
 //   2      : start AUTO run
 //   3      : gripper open / close
-//   4      : target override: AUTO(colour) -> B1 -> B2 -> B3 -> AUTO
-//            (lets you test branch counting without the colour sensor)
+//   4      : run mode: BASIC (basic map) -> BASIC (adv map) -> ADVANCED
 //  Status messages are also sent to the app's UART screen.
-//
-//  Everything marked "TUNE" depends on your chassis and will need
-//  adjusting on the real track.
+//  Testing / tuning workflow: see TESTING.md.
 // =====================================================================
 #include <Arduino.h>
 #include <BLEDevice.h>
@@ -104,11 +106,12 @@ uint32_t START_GRACE_MS = 700;           // TUNE
 int      JUNCTION_CONFIRM_READS = 2;     // consecutive loops the pattern must be seen
 uint32_t JUNCTION_MIN_GAP_MS = 350;      // TUNE: min time between two branches
 
-// Map mode ("set map 0" / "set map 1"):
-//   0 = basic map: no stations, every left branch is a ball branch.
-//   1 = advanced map: the 3 station branches (on the left, heading down) come
-//       first, so branches only count after CORNERS_BEFORE_BALLS right corners.
-int      MAP_MODE = 1;                   // the track in use is the advanced map
+// Run mode ("set mode <0-2>" or phone button 4):
+//   0 = BASIC task, basic map: no stations, every left branch is a ball branch.
+//   1 = BASIC task, advanced map: the 3 station branches (on the left, heading
+//       down) come first, so branches only count after CORNERS_BEFORE_BALLS corners.
+//   2 = ADVANCED task (advanced map).
+int      RUN_MODE = 1;
 int      CORNERS_BEFORE_BALLS = 2;       // right corners before the ball branches
 uint32_t CORNER_MIN_GAP_MS = 1000;       // corners are >= 40 cm apart; ignore re-pivots
 
@@ -121,6 +124,22 @@ uint32_t TURN_TIMEOUT_MS = 2500;         // give up and go manual if the branch 
 
 // Colour card
 int COLOR_CONFIRM_READS = 3;             // same colour this many reads in a row = locked
+int CARD_MAX_C = 3000;                   // clear count below this = a card (white floor ~4000, cards 1200-2200); 0 = off
+int CARD_WHITE_READS = 2;                // white reads between two cards (advanced: 3 cards in a row)
+
+// Advanced task
+uint32_t GRAB_MS = 400;                  // wait after closing / opening the gripper
+int      BACK_SPEED = 135;               // reverse speed back along a branch to the T
+uint32_t BALL_BACK_MS = 250;             // TUNE: ignore ball crossbar for this long while reversing
+uint32_t STATION_BACK_MS = 250;          // TUNE: ignore station crossbar for this long while reversing
+uint32_t T_FWD_MS = 220;                 // TUNE: drive forward after backing onto the T before 90 deg turn
+uint32_t BACK_TIMEOUT_MS = 3000;         // give up if T isn't reached while reversing
+// Steering while reversing. The IR bar trails the wheels when reversing, which
+// is unstable with strong steering, so: gentle correction on the inner sensors,
+// and stop-and-pivot (no travel, so no snaking) when an edge sensor sees the line.
+int      REVERSE_KP = 25;                // TUNE: PWM difference when IR3/IR4 sees the line (0 = off)
+uint32_t REALIGN_TIMEOUT_MS = 1000;      // realign pivot gives up after this
+int      TJUNC_READS = 2;                // T junction (line on both sides) confirm loops
 
 // Live-tunable parameter table (name used in "set <name> <value>")
 struct Param { const char* name; char type; void* ptr; };   // type: f=float i=int u=uint32
@@ -138,7 +157,7 @@ const Param PARAMS[] = {
   {"grace",   'u', &START_GRACE_MS},
   {"jreads",  'i', &JUNCTION_CONFIRM_READS},
   {"jgap",    'u', &JUNCTION_MIN_GAP_MS},
-  {"map",     'i', &MAP_MODE},
+  {"mode",    'i', &RUN_MODE},
   {"corners", 'i', &CORNERS_BEFORE_BALLS},
   {"cgap",    'u', &CORNER_MIN_GAP_MS},
   {"fwdspd",  'i', &TURN_FORWARD_SPEED},
@@ -147,6 +166,18 @@ const Param PARAMS[] = {
   {"turnmin", 'u', &TURN_MIN_SPIN_MS},
   {"turnto",  'u', &TURN_TIMEOUT_MS},
   {"creads",  'i', &COLOR_CONFIRM_READS},
+  {"cardmax", 'i', &CARD_MAX_C},
+  {"cwhite",  'i', &CARD_WHITE_READS},
+  {"cdist",   'f', &colorMaxDistance},
+  {"grabms",  'u', &GRAB_MS},
+  {"backspd", 'i', &BACK_SPEED},
+  {"bback",   'u', &BALL_BACK_MS},
+  {"sback",   'u', &STATION_BACK_MS},
+  {"tfwdms",  'u', &T_FWD_MS},
+  {"backto",  'u', &BACK_TIMEOUT_MS},
+  {"rkp",     'i', &REVERSE_KP},
+  {"realto",  'u', &REALIGN_TIMEOUT_MS},
+  {"treads",  'i', &TJUNC_READS},
   {"manual",  'i', &MANUAL_SPEED},
   {"gopen",   'i', &GRIPPER_OPEN_ANGLE},
   {"gclose",  'i', &GRIPPER_CLOSED_ANGLE},
@@ -156,6 +187,7 @@ const int NUM_PARAMS = sizeof(PARAMS) / sizeof(PARAMS[0]);
 
 // Telemetry (off by default; "tel on", "tel 20" = 20 Hz, "tel off")
 bool     telemetryOn = false;
+bool     colorRawOn = false;             // "craw on": stream every colour reading as K lines
 uint32_t telemetryPeriodMs = 50;
 
 // Behaviour switches
@@ -163,7 +195,19 @@ const bool ABORT_AUTO_ON_DISCONNECT = true;
 
 // ===================== State =====================
 enum RobotMode { MODE_MANUAL, MODE_AUTO };
-enum AutoPhase { PH_IDLE, PH_TO_BRANCH, PH_TURN_FORWARD, PH_TURN_SPIN, PH_TO_BALL };
+// Telemetry "phase" is this number.
+enum AutoPhase {
+  PH_IDLE,            // 0
+  PH_TO_BRANCH,       // 1 out: start -> ball branch (reads cards)
+  PH_TURN_FORWARD,    // 2 turn-in: drive on over the junction
+  PH_TURN_SPIN,       // 3 turn-in: pivot into the branch
+  PH_TO_BALL,         // 4 follow the ball branch to its end bar
+  PH_GRAB,            // 5 advanced: gripper closed / opened, wait
+  PH_BACKUP,          // 6 advanced: reverse straight back to the T, then 90 deg turn (phases 2-3)
+  PH_TO_STATION,      // 7 advanced: bottom line east, left corner, count stations
+  PH_TO_STATION_END,  // 8 advanced: follow the station branch to its end bar
+  PH_TO_BASE          // 9 advanced: to base 1 or 2, stop on the box edge
+};
 
 RobotMode mode = MODE_MANUAL;
 AutoPhase phase = PH_IDLE;
@@ -171,7 +215,7 @@ AutoPhase phase = PH_IDLE;
 // Written by BLE callbacks (core 0), consumed by loop() (core 1)
 volatile int  manualLeft = 0, manualRight = 0;
 volatile bool reqManual = false, reqAuto = false;
-volatile bool reqGripperToggle = false, reqCycleTarget = false;
+volatile bool reqGripperToggle = false, reqCycleMode = false;
 volatile bool deviceConnected = false;    // true while at least one device is connected
 volatile int  connectedCount = 0;         // phone + PC logger can both be connected
 volatile bool reqDisconnectStop = false;
@@ -192,19 +236,34 @@ uint32_t  lastTelemetryMs = 0;
 float previousError = 0, integral = 0;
 int      lastOuterSide = 0;              // -1 / +1: an outer sensor last saw the line on that side
 uint32_t lastOuterMs = 0;
-uint32_t lastFarLeftMs = 0;              // IR1 (branch detector) last saw black
-bool     leftFeature = false;            // a branch-like line is under IR2 (cross it straight)
+uint32_t lastBranchMs = 0;               // a branch (not-corner side) was last under the sensors
+bool     branchFeature = false;          // a branch is under the branch-side sensors (cross it straight)
+int      cornerSide = 1;                 // +1: corners turn right, branches on the left; -1: mirrored; 0: neither
 uint32_t lastLineMs = 0;                 // any sensor last saw black
 int      pivotDir = 0;                   // -1 / +1 while pivoting to find a corner line
 uint32_t pivotStartMs = 0;               // corner move started (forward, then pivot)
 uint32_t pivotFwdMs = 0;                 // forward part of the current move
-bool     rightFeature = false;           // a corner strip is under IR4/IR5
-int      rightHitReads = 0, rightClearReads = 0;
-int      rightCorners = 0;               // right-corner pivots this run
+bool     cornerFeature = false;          // a corner strip is under the corner-side sensors
+int      cornerHitReads = 0, cornerClearReads = 0;
+int      legCorners = 0;                 // corners taken in the current leg of the route
 uint32_t lastCornerMs = 0;
 uint32_t autoStartMs = 0;
 uint32_t phaseStartMs = 0;
-bool spinSawBranch = false;             // IR1/IR2 saw the branch during the turn-in pivot
+bool spinSawBranch = false;             // the outer sensor saw the target line during the 90 deg pivot
+int       turnDir = -1;                  // 90 deg turn direction: -1 left, +1 right
+uint32_t  turnFwdMs = 180;               // PH_TURN_FORWARD duration for the current turn
+int       turnNextSide = 0;              // cornerSide after the turn
+AutoPhase turnNext = PH_TO_BALL;         // phase after the turn
+uint32_t  backClearMs = 250;             // PH_BACKUP: ignore crossbar this long before looking for the T
+int       realignDir = 0;                // PH_BACKUP: -1/+1 while pivoting back onto the line
+uint32_t  realignStartMs = 0;
+uint32_t  backPausedMs = 0;              // time spent realigning (doesn't count toward backto)
+int       tTurnDir = -1;                 // 90 deg turn at the T after reversing: -1 left, +1 right
+int       tNextSide = -1;                // cornerSide after that T
+AutoPhase tNext = PH_TO_STATION;         // phase after that T
+int       tReads = 0;
+int       stationsPassed = 0;
+bool      haveBall = false;              // advanced: true between grab and release
 
 int  junctionsPassed = 0;
 int  junctionSeenReads = 0;
@@ -212,9 +271,13 @@ bool junctionLatched = false;
 uint32_t lastJunctionMs = 0;
 
 bool      colorSensorOk = false;
-CardColor detectedColor = COLOR_NONE;
+CardColor detectedColor = COLOR_NONE;    // card 1 (basic: the only card)
 CardColor colorCandidate = COLOR_NONE;
 int       colorCandidateReads = 0;
+CardColor cards[3] = {COLOR_NONE, COLOR_NONE, COLOR_NONE};   // advanced: ball, station, base
+int       cardCount = 0;
+bool      cardLocked = false;            // the card under the sensor has been recorded
+int       cardWhiteReads = 0;
 
 // Live readout in manual mode (for checking the mounted sensor)
 CardColor liveColor = COLOR_NONE;
@@ -222,6 +285,8 @@ CardColor liveCandidate = COLOR_NONE;
 int       liveCandidateReads = 0;
 
 int  targetOverride = 0;                 // 0 = use colour, 1..3 = forced ball
+int  stationOverride = 0;                // advanced: forced station (0 = card 2)
+int  baseOverride = 0;                   // advanced: forced base (0 = card 3)
 bool gripperClosed = false;
 
 char statusMsg[24] = "Ready";
@@ -236,6 +301,8 @@ BLEServer* pServer = nullptr;
 BLECharacteristic* pTxCharacteristic = nullptr;
 
 void sendParams();   // defined in the "Text commands & telemetry" section
+struct ColorReading;
+void sendColorRaw(const ColorReading& rd);
 
 // ===================== Helpers =====================
 int ballForColor(CardColor c) {
@@ -247,8 +314,24 @@ int ballForColor(CardColor c) {
   }
 }
 
+bool advMap()  { return RUN_MODE >= 1; }
+bool advTask() { return RUN_MODE == 2; }
+
+const char* modeName() {
+  switch (RUN_MODE) { case 0: return "BASIC/basic map"; case 1: return "BASIC/adv map"; default: return "ADVANCED"; }
+}
+
 int currentTarget() {
   return targetOverride > 0 ? targetOverride : ballForColor(detectedColor);
+}
+int stationTarget() {
+  return stationOverride > 0 ? stationOverride : ballForColor(cards[1]);   // R1 B2 G3
+}
+int baseTarget() {
+  if (baseOverride > 0) return baseOverride;
+  if (cards[2] == COLOR_RED) return 1;
+  if (cards[2] == COLOR_BLUE) return 2;
+  return 0;                                                 // green / none: not defined by the rules
 }
 
 // Send one line to every connected BLE device (and USB serial).
@@ -302,6 +385,8 @@ void applyGripper() {
 }
 
 // ===================== OLED =====================
+char colorChar(CardColor c);   // defined with telemetry
+
 void updateOLED() {
   char buf[24];
   display.clearDisplay();
@@ -315,12 +400,21 @@ void updateOLED() {
 
   display.setTextSize(2);
   display.setCursor(0, 13);
-  display.print(mode == MODE_AUTO ? "AUTO" : "MANUAL");
+  display.print(mode == MODE_AUTO ? "AUTO" : "MAN");
 
+  // Run mode, two short lines on the right
   display.setTextSize(1);
+  display.setCursor(56, 13);
+  display.print(advTask() ? "ADVANCED" : "BASIC");
+  display.setCursor(56, 22);
+  display.print(advMap() ? "adv map" : "basic map");
+
   display.setCursor(0, 32);
   int tgt = currentTarget();
-  if (targetOverride > 0) snprintf(buf, sizeof(buf), "Target: B%d (forced)", tgt);
+  if (advTask()) {
+    snprintf(buf, sizeof(buf), "%c%c%c B%d S%d H%d", colorChar(cards[0]), colorChar(cards[1]),
+             colorChar(cards[2]), tgt, stationTarget(), baseTarget());
+  } else if (targetOverride > 0) snprintf(buf, sizeof(buf), "Target: B%d (forced)", tgt);
   else if (mode == MODE_MANUAL && colorSensorOk)
                           snprintf(buf, sizeof(buf), "Sees: %s", liveColor == COLOR_NONE ? "--" : colorName(liveColor));
   else if (tgt > 0)       snprintf(buf, sizeof(buf), "Colour %s -> B%d", colorName(detectedColor), tgt);
@@ -328,8 +422,8 @@ void updateOLED() {
   display.print(buf);
 
   display.setCursor(0, 42);
-  if (mode == MODE_AUTO) snprintf(buf, sizeof(buf), "Branch %d/%d", junctionsPassed, tgt);
-  else                   snprintf(buf, sizeof(buf), "%s", statusMsg);
+  if (mode == MODE_AUTO && phase == PH_TO_BRANCH) snprintf(buf, sizeof(buf), "Branch %d/%d", junctionsPassed, tgt);
+  else snprintf(buf, sizeof(buf), "%s", statusMsg);
   display.print(buf);
 
   display.setCursor(0, 54);
@@ -353,26 +447,47 @@ IRState readIR() {
   return ir;
 }
 
+// True when the reading looks like a card: darker than the white floor but not
+// the black line. Stops white being read as GREEN (they are close in r/g/b).
+bool cardUnderSensor(const ColorReading& rd) {
+  if (rd.c <= COLOR_MIN_CLEAR) return false;
+  return CARD_MAX_C <= 0 || rd.c < (uint16_t)CARD_MAX_C;
+}
+
+// Basic: lock the first card seen COLOR_CONFIRM_READS times in a row.
+// Advanced: record up to 3 cards, each separated by CARD_WHITE_READS white reads.
 void pollColor() {
-  if (!colorSensorOk || detectedColor != COLOR_NONE) return;
+  if (!colorSensorOk) return;
+  if (advTask() ? cardCount >= 3 : detectedColor != COLOR_NONE) return;
   ColorReading rd;
   if (!colorSensorRead(rd)) return;
   lastColorC = rd.c;
   lastColorClass = rd.color;
+  sendColorRaw(rd);
 
-  if (rd.color != COLOR_NONE && rd.color == colorCandidate) {
-    colorCandidateReads++;
+  CardColor c = cardUnderSensor(rd) ? rd.color : COLOR_NONE;
+  if (c == COLOR_NONE) {
+    colorCandidate = COLOR_NONE;
+    colorCandidateReads = 0;
+    if (++cardWhiteReads >= CARD_WHITE_READS) cardLocked = false;   // gap: ready for the next card
+    return;
+  }
+  cardWhiteReads = 0;
+  if (c == colorCandidate) colorCandidateReads++;
+  else { colorCandidate = c; colorCandidateReads = 1; }
+  if (cardLocked || colorCandidateReads < COLOR_CONFIRM_READS) return;
+
+  cardLocked = true;
+  char msg[24];
+  if (!advTask()) {
+    detectedColor = c;
+    snprintf(msg, sizeof(msg), "Colour %s -> B%d", colorName(c), ballForColor(c));
   } else {
-    colorCandidate = rd.color;
-    colorCandidateReads = (rd.color != COLOR_NONE) ? 1 : 0;
+    cards[cardCount++] = c;
+    if (cardCount == 1) detectedColor = c;                    // card 1 = the ball
+    snprintf(msg, sizeof(msg), "Card %d: %s", cardCount, colorName(c));
   }
-
-  if (colorCandidateReads >= COLOR_CONFIRM_READS) {
-    detectedColor = colorCandidate;
-    char msg[24];
-    snprintf(msg, sizeof(msg), "Colour %s -> B%d", colorName(detectedColor), ballForColor(detectedColor));
-    setStatus(msg);
-  }
+  setStatus(msg);
 }
 
 // Manual mode: show what the sensor sees right now (2 matching reads to change)
@@ -382,6 +497,7 @@ void pollLiveColor() {
   if (!colorSensorRead(rd)) return;
   lastColorC = rd.c;
   lastColorClass = rd.color;
+  sendColorRaw(rd);
 
   if (rd.color == liveCandidate) liveCandidateReads++;
   else { liveCandidate = rd.color; liveCandidateReads = 1; }
@@ -393,30 +509,34 @@ void pollLiveColor() {
 }
 
 // ===================== Line following =====================
-// straightThrough = true while crossing a branch we don't want: ignore the
-// branch so PID doesn't pull the robot into it.
+// The 19 mm line can never cover two neighbouring sensors (23 mm apart), so a
+// drifting line only ever lights one sensor. Two neighbours together = a line
+// lying ACROSS the sensors: a corner strip or a branch.
+//   left side : IR2 with IR1 or IR3        right side: IR4 and IR5
+// cornerSide says which side is a corner on this leg (turn that way) and which
+// is a branch (cross it straight). Outbound: corners right, branches left.
+// straightThrough = true forces straight driving (e.g. crossing a ball branch).
 void resetLineMemory() {
   lastOuterSide = 0;
   pivotDir = 0;
-  leftFeature = false;
-  rightFeature = false;
-  rightHitReads = 0;
-  rightClearReads = 0;
+  branchFeature = false;
+  cornerFeature = false;
+  cornerHitReads = 0;
+  cornerClearReads = 0;
 }
 
 // Start a turn: drive forward fwdMs (0 = pivot at once), then pivot toward dir
-// until an inner sensor finds the line. A right turn with a forward part is a
-// map corner and is counted.
-void startCorner(int dir, uint32_t fwdMs, uint32_t now) {
+// until an inner sensor finds the line. count = a map corner (logged, counted).
+void startCorner(int dir, uint32_t fwdMs, uint32_t now, bool count) {
   pivotDir = dir;
   pivotFwdMs = fwdMs;
   pivotStartMs = now;
   lastOuterSide = 0;
-  if (dir == 1 && fwdMs > 0) {
-    rightCorners++;
-    lastCornerMs = now;
+  lastCornerMs = now;
+  if (count) {
+    legCorners++;
     char msg[24];
-    snprintf(msg, sizeof(msg), "Corner %d", rightCorners);
+    snprintf(msg, sizeof(msg), "Corner %d %s", legCorners, dir > 0 ? "R" : "L");
     setStatus(msg);
   }
   setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
@@ -427,7 +547,7 @@ void followLine(const IRState& ir, bool straightThrough) {
   int n = ir.s2 + ir.s3 + ir.s4 + ir.s5;          // steering sensors (IR1 = branch detector)
   float error;
 
-  // ---- Corner move in progress (see startCorner) ----
+  // ---- Turn in progress (see startCorner) ----
   // Drive forward pivotFwdMs so the wheels sit over the corner, then pivot
   // until an INNER sensor finds the new line. The outer sensors sweep across
   // the corner line early in the pivot and must not end it.
@@ -442,41 +562,41 @@ void followLine(const IRState& ir, bool straightThrough) {
     }
     pivotDir = 0;                      // found it: back to PID below
     lastOuterSide = 0;
-    rightFeature = false;
-    rightHitReads = 0;
+    cornerFeature = false;
+    cornerHitReads = 0;
   }
 
-  // ---- Left: branch vs drift ----
-  // The 19 mm line can never cover two neighbouring sensors (23 mm apart), so
-  // a drifting line only ever lights IR2 on its own. A branch lies across the
-  // sensors: IR2 together with IR1 or IR3. Then drive straight until IR1/IR2 clear.
-  if (ir.s2 && (ir.s1 || ir.s3)) leftFeature = true;
-  if (!ir.s1 && !ir.s2) leftFeature = false;
-  if (ir.s1 || leftFeature) {
-    lastFarLeftMs = now;
-    straightThrough = true;
-  }
+  if (cornerSide != 0) {
+    bool leftHit  = ir.s2 && (ir.s1 || ir.s3);
+    bool rightHit = ir.s4 && ir.s5;
+    bool cornerHit   = cornerSide > 0 ? rightHit : leftHit;
+    bool branchHit   = cornerSide > 0 ? (leftHit || ir.s1) : rightHit;   // IR1 only ever sees a branch
+    bool cornerClear = cornerSide > 0 ? (!ir.s4 && !ir.s5) : (!ir.s1 && !ir.s2);
+    bool branchClear = cornerSide > 0 ? (!ir.s1 && !ir.s2) : (!ir.s4 && !ir.s5);
 
-  // ---- Right: corner vs drift ----
-  // Drifting, the line goes IR4 -> (both white) -> IR5: it can never cover IR4
-  // and IR5 together (23 mm apart, 19 mm line). A corner strip lies across the
-  // right side, so it lights IR4 AND IR5 together.
-  // It must hold for CORNER_CONFIRM_READS loops (IR5 noise), and once latched
-  // nothing cancels it until both right sensors read white again - whichever
-  // of IR4/IR5 leaves the strip first (the robot may be slightly angled).
-  bool rightHit = ir.s4 && ir.s5 && now - lastCornerMs > CORNER_MIN_GAP_MS;
-  rightHitReads = rightHit ? rightHitReads + 1 : 0;
-  if (!rightFeature && rightHitReads >= CORNER_CONFIRM_READS) rightFeature = true;
-
-  if (rightFeature) {
-    rightClearReads = (!ir.s4 && !ir.s5) ? rightClearReads + 1 : 0;
-    if (rightClearReads >= 2) {        // strip passed: turn
-      rightFeature = false;
-      rightClearReads = 0;
-      startCorner(1, CORNER_FWD_MS, now);
-      return;
+    // ---- Branch side: cross it straight until it clears ----
+    if (branchHit) branchFeature = true;
+    if (branchClear) branchFeature = false;
+    if (branchFeature) {
+      lastBranchMs = now;
+      straightThrough = true;
     }
-    straightThrough = true;            // hold the heading while crossing the strip
+
+    // ---- Corner side: confirm (noise filter), latch, turn when it clears ----
+    // Once latched nothing cancels it until the corner-side sensors read white
+    // again, whichever leaves the strip first (the robot may be slightly angled).
+    cornerHitReads = (cornerHit && now - lastCornerMs > CORNER_MIN_GAP_MS) ? cornerHitReads + 1 : 0;
+    if (!cornerFeature && cornerHitReads >= CORNER_CONFIRM_READS) cornerFeature = true;
+    if (cornerFeature) {
+      cornerClearReads = cornerClear ? cornerClearReads + 1 : 0;
+      if (cornerClearReads >= 2) {     // strip passed: turn
+        cornerFeature = false;
+        cornerClearReads = 0;
+        startCorner(cornerSide, CORNER_FWD_MS, now, true);
+        return;
+      }
+      straightThrough = true;          // hold the heading while crossing the strip
+    }
   }
 
   // ---- Drift memory (for the rare case the line drifts out past an edge) ----
@@ -492,8 +612,8 @@ void followLine(const IRState& ir, bool straightThrough) {
     // All white: centred between IR3 and IR4, a dashed gap, or lost.
     // Pivot in place only if an outer sensor just lost the line (drifted out).
     if (lastOuterSide != 0 && now - lastOuterMs <= OUTER_MEMORY_MS &&
-        now - lastFarLeftMs > OUTER_MEMORY_MS) {
-      startCorner(lastOuterSide, 0, now);
+        now - lastBranchMs > OUTER_MEMORY_MS) {
+      startCorner(lastOuterSide, 0, now, false);
       return;
     }
     error = 0;
@@ -522,26 +642,78 @@ void enterPhase(AutoPhase p) {
   displayDirty = true;
 }
 
-void startAutoRun() {
-  mode = MODE_AUTO;
+void resetPid() {
   previousError = 0;
   integral = 0;
+}
+
+// New leg of the route: corners/branches counted afresh
+void startLeg(AutoPhase p, int side) {
+  cornerSide = side;
+  legCorners = 0;
   resetLineMemory();
-  rightCorners = 0;
+  resetPid();
+  enterPhase(p);
+}
+
+void startAutoRun() {
+  mode = MODE_AUTO;
   lastCornerMs = 0;
   lastLineMs = millis();
   junctionsPassed = 0;
   junctionSeenReads = 0;
   junctionLatched = false;
   lastJunctionMs = 0;
+  stationsPassed = 0;
+  tReads = 0;
+  haveBall = false;
   detectedColor = COLOR_NONE;
   colorCandidate = COLOR_NONE;
   colorCandidateReads = 0;
+  for (int i = 0; i < 3; i++) cards[i] = COLOR_NONE;
+  cardCount = 0;
+  cardLocked = false;
+  cardWhiteReads = 0;
+  if (advTask()) { gripperClosed = false; applyGripper(); }   // open, ready for the ball
+  turnDir = -1;
+  turnFwdMs = TURN_FORWARD_MS;
+  turnNext = PH_TO_BALL;
+  turnNextSide = 0;
   autoStartMs = millis();
-  enterPhase(PH_TO_BRANCH);
-  setStatus(MAP_MODE ? "AUTO: advanced map" : "AUTO: basic map");
-  setStatus(targetOverride ? "AUTO (forced target)" : "AUTO: reading colour");
+  startLeg(PH_TO_BRANCH, 1);
+  char msg[24];
+  snprintf(msg, sizeof(msg), "AUTO %s", modeName());
+  setStatus(msg);
+  if (targetOverride || stationOverride || baseOverride) setStatus("forced targets");
   sendParams();                        // log the settings used for this run
+}
+
+// Advanced task, starting part-way so one leg can be tested on its own.
+// Targets come from "adv <ball> <station> <base>".
+bool startAutoAt(const char* where) {
+  if (!advTask()) { setStatus("auto <leg>: mode 2 only"); return false; }
+  if (currentTarget() == 0 || stationTarget() == 0 || baseTarget() == 0) {
+    setStatus("set adv b s h first");
+    return false;
+  }
+  AutoPhase p;
+  int side = 0;
+  bool ball;
+  if (!strcasecmp(where, "ball"))         { p = PH_TO_BALL;        ball = false; }
+  else if (!strcasecmp(where, "station")) { p = PH_TO_STATION;     ball = true; side = -1; }
+  else if (!strcasecmp(where, "stend"))   { p = PH_TO_STATION_END; ball = true; }
+  else { setStatus("auto ball|station|stend"); return false; }
+
+  startAutoRun();                      // reset everything, then jump to the leg
+  haveBall = ball;
+  gripperClosed = ball;
+  applyGripper();
+  startLeg(p, side);
+  if (p == PH_TO_STATION) legCorners = 1;   // as if corner 2 was just taken
+  char msg[24];
+  snprintf(msg, sizeof(msg), "AUTO from %s", where);
+  setStatus(msg);
+  return true;
 }
 
 // Stop and hand control back to the user
@@ -554,18 +726,32 @@ void endAutoRun(const char* msg) {
   setStatus(msg);
 }
 
+// Gripper action done: reverse straight back to the T (ignoring the crossbar
+// for clearMs), drive forward T_FWD_MS, then pivot 90 deg (turnAtT: -1 left /
+// +1 right) and continue in phase next with cornerSide = side.
+void leaveBranch(uint32_t clearMs, int turnAtT, int side, AutoPhase next) {
+  backClearMs = clearMs;
+  realignDir = 0;
+  backPausedMs = 0;
+  tTurnDir = turnAtT;
+  tNextSide = side;
+  tNext = next;
+  tReads = 0;
+  enterPhase(PH_BACKUP);
+}
+
 void autoStep() {
   IRState ir = readIR();
   uint32_t now = millis();
 
   // Safety: centred on a straight is also all-white, but never for this long
   if (ir.active > 0) lastLineMs = now;
-  if ((phase == PH_TO_BRANCH || phase == PH_TO_BALL) && now - lastLineMs > LOST_STOP_MS) {
+  bool following = phase == PH_TO_BRANCH || phase == PH_TO_BALL ||
+                   phase == PH_TO_STATION || phase == PH_TO_STATION_END || phase == PH_TO_BASE;
+  if (following && now - lastLineMs > LOST_STOP_MS) {
     endAutoRun("Line lost");
     return;
   }
-
-  if (phase == PH_TO_BRANCH) pollColor();
 
   switch (phase) {
     case PH_TO_BRANCH: {
@@ -573,11 +759,23 @@ void autoStep() {
       if (now - autoStartMs < START_GRACE_MS) {
         // No pivots here: the box edge crossing the outer sensors at an angle
         // looks like a corner. Steer on the inner sensors only, else go straight.
+        // No colour reads either: the box edge can read as a card.
         int n = ir.s2 + ir.s3 + ir.s4 + ir.s5;
         if (ir.active >= 4 || n == 0) setMotors(AUTO_BASE_SPEED, AUTO_BASE_SPEED);
         else followLine(ir, false);
         resetLineMemory();
         return;
+      }
+      if (legCorners == 0) pollColor();      // the cards are all before corner 1
+
+      // Advanced: all three targets must be known by the first corner
+      if (advTask() && legCorners >= 1) {
+        if (currentTarget() == 0 || stationTarget() == 0 || baseTarget() == 0) {
+          char msg[24];
+          snprintf(msg, sizeof(msg), "Cards: %d read, need 3", cardCount);
+          endAutoRun(msg);
+          return;
+        }
       }
 
       // Only the T crossbar / a box edge covers all five; corners and branches never do
@@ -589,7 +787,7 @@ void autoStep() {
       bool leftBranch = ir.s1 && ir.s2 && !ir.s5;
       junctionSeenReads = leftBranch ? junctionSeenReads + 1 : 0;
       // Before the ball section (station branches): cross straight, don't count
-      bool countBranches = MAP_MODE == 0 || rightCorners >= CORNERS_BEFORE_BALLS;
+      bool countBranches = !advMap() || legCorners >= CORNERS_BEFORE_BALLS;
 
       if (leftBranch) {
         if (countBranches && !junctionLatched && junctionSeenReads >= JUNCTION_CONFIRM_READS &&
@@ -607,6 +805,10 @@ void autoStep() {
           setStatus(msg);
 
           if (junctionsPassed >= tgt) {
+            turnDir = -1;
+            turnFwdMs = TURN_FORWARD_MS;
+            turnNext = PH_TO_BALL;
+            turnNextSide = 0;
             setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
             enterPhase(PH_TURN_FORWARD);
             return;
@@ -622,26 +824,28 @@ void autoStep() {
 
     case PH_TURN_FORWARD:
       setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
-      if (now - phaseStartMs >= TURN_FORWARD_MS) {
+      if (now - phaseStartMs >= turnFwdMs) {
         spinSawBranch = false;
         enterPhase(PH_TURN_SPIN);
       }
       break;
 
     case PH_TURN_SPIN: {
-      setMotors(-TURN_SPIN_SPEED, TURN_SPIN_SPEED);   // pivot left
+      setMotors(turnDir * TURN_SPIN_SPEED, -turnDir * TURN_SPIN_SPEED);
       uint32_t t = now - phaseStartMs;
-      // The branch sweeps in from the LEFT (IR1/IR2 first, then IR3). The main
-      // line moves right in a left pivot, so IR3 alone (no IR1/IR2 before it)
-      // is still the main line - accepting it drove the robot on to base 2.
-      if (ir.s1 || ir.s2) spinSawBranch = true;
-      if (t >= TURN_MIN_SPIN_MS && spinSawBranch && ir.s3) {
-        previousError = 0;
-        integral = 0;
-        resetLineMemory();
+      // The target line sweeps in from the turn side (left: IR1/IR2 then IR3;
+      // right: IR5 then IR4). The old line moves the other way in the pivot,
+      // so the inner sensor alone (no outer before it) is still the old line.
+      bool outer = turnDir < 0 ? (ir.s1 || ir.s2) : ir.s5;
+      bool inner = turnDir < 0 ? ir.s3 : ir.s4;
+      if (outer) spinSawBranch = true;
+      if (t >= TURN_MIN_SPIN_MS && spinSawBranch && inner) {
         setMotors(0, 0);
-        enterPhase(PH_TO_BALL);
-        setStatus("On branch");
+        startLeg(turnNext, turnNextSide);
+        if (turnNext == PH_TO_BALL)             setStatus("On branch");
+        else if (turnNext == PH_TO_STATION_END) setStatus("On station branch");
+        else if (turnNext == PH_TO_STATION)     setStatus("To station");
+        else                                    setStatus("To base");
       } else if (t > TURN_TIMEOUT_MS) {
         endAutoRun("Turn timeout");
       }
@@ -650,13 +854,159 @@ void autoStep() {
 
     case PH_TO_BALL:
       if (ir.active >= 4) {
-        if (AUTO_CLOSE_GRIPPER_ON_ARRIVAL) { gripperClosed = true; applyGripper(); }
         char msg[24];
-        snprintf(msg, sizeof(msg), "ARRIVED ball %d", currentTarget());
-        endAutoRun(msg);
+        if (advTask()) {
+          setMotors(0, 0);
+          gripperClosed = true;
+          applyGripper();
+          haveBall = true;
+          snprintf(msg, sizeof(msg), "Got ball %d", currentTarget());
+          setStatus(msg);
+          enterPhase(PH_GRAB);
+        } else {
+          if (AUTO_CLOSE_GRIPPER_ON_ARRIVAL) { gripperClosed = true; applyGripper(); }
+          snprintf(msg, sizeof(msg), "ARRIVED ball %d", currentTarget());
+          endAutoRun(msg);
+        }
       } else {
         followLine(ir, false);
       }
+      break;
+
+    case PH_GRAB:                       // gripper moving
+      setMotors(0, 0);
+      if (now - phaseStartMs >= GRAB_MS) {
+        if (haveBall) {
+          // Reverse straight back up the ball branch to the T (still facing into
+          // the branch), then turn LEFT (east): corners now turn LEFT and the
+          // other ball branches are on the RIGHT.
+          leaveBranch(BALL_BACK_MS, -1, -1, PH_TO_STATION);
+        } else {
+          // Released at the station: reverse back to the vertical line, then to the base
+          if (baseTarget() == 1) leaveBranch(STATION_BACK_MS, -1, -1, PH_TO_BASE);  // north, left corner
+          else                   leaveBranch(STATION_BACK_MS, 1, 1, PH_TO_BASE);    // south, right corner
+        }
+      }
+      break;
+
+    case PH_BACKUP: {
+      // Reverse back to the T on the main line (line on BOTH sides), then drive
+      // forward T_FWD_MS and pivot 90 deg onto the main line. The IR bar keeps
+      // the reverse on the branch (see REVERSE_KP).
+      uint32_t t = now - phaseStartMs;
+      bool tHit = (ir.s1 || ir.s2) && (ir.s4 || ir.s5);
+      bool leftEdge  = (ir.s1 || ir.s2) && !ir.s4 && !ir.s5;
+      bool rightEdge = ir.s5 && !ir.s1 && !ir.s2;
+
+      if (t < backClearMs) {             // still on the end bar: straight back, no checks
+        setMotors(-BACK_SPEED, -BACK_SPEED);
+        break;
+      }
+
+      if (realignDir != 0) {
+        // Pivot in place until an inner sensor has the line again (or we reach the T)
+        if (ir.s3 || ir.s4 || tHit) {
+          backPausedMs += now - realignStartMs;
+          realignDir = 0;
+        } else if (now - realignStartMs > REALIGN_TIMEOUT_MS) {
+          endAutoRun("Reverse lost line");
+          return;
+        } else {
+          setMotors(realignDir * LOST_LINE_SPIN, -realignDir * LOST_LINE_SPIN);
+          break;
+        }
+      }
+
+      if (!tHit && (leftEdge || rightEdge) && tReads == 0) {
+        // Edge sensor: the bar is well off the line. Stop and pivot toward it:
+        // line on the right -> pivot right (moves the bar right), and vice versa.
+        realignDir = rightEdge ? 1 : -1;
+        realignStartMs = now;
+        setMotors(realignDir * LOST_LINE_SPIN, -realignDir * LOST_LINE_SPIN);
+        setStatus(rightEdge ? "Reverse: realign R" : "Reverse: realign L");
+        break;
+      }
+
+      // Gentle steering on the inner sensors: same turning sense as forward
+      // (line on the right -> turn right), kept small because the bar trails.
+      int e = (ir.s4 && !ir.s3) ? 1 : (ir.s3 && !ir.s4) ? -1 : 0;
+      if (tHit) e = 0;
+      setMotors(-BACK_SPEED + e * REVERSE_KP, -BACK_SPEED - e * REVERSE_KP);
+
+      {
+        tReads = tHit ? tReads + 1 : 0;
+        if (tReads >= TJUNC_READS) {
+          turnDir = tTurnDir;
+          turnFwdMs = T_FWD_MS;
+          turnNext = tNext;
+          turnNextSide = tNextSide;
+          setStatus(tTurnDir > 0 ? "T: turn right" : "T: turn left");
+          setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
+          enterPhase(PH_TURN_FORWARD);
+          return;
+        }
+      }
+      if (t - backPausedMs > BACK_TIMEOUT_MS) endAutoRun("Back timeout");
+      break;
+    }
+
+    case PH_TO_STATION: {
+      // East along the bottom line (ball branches on the right: cross them),
+      // LEFT corner, then north: stations on the RIGHT, station 3 comes first.
+      // (pivotDir: the T-turn that starts this leg still has the T under the sensors)
+      if (ir.active == 5 && pivotDir == 0) { endAutoRun("Stopped: all black"); return; }
+      if (legCorners >= 1 && pivotDir == 0) {
+        bool rightBranch = ir.s4 && ir.s5 && !ir.s1 && !ir.s2;
+        junctionSeenReads = rightBranch ? junctionSeenReads + 1 : 0;
+        if (rightBranch && !junctionLatched && junctionSeenReads >= JUNCTION_CONFIRM_READS &&
+            now - lastJunctionMs > JUNCTION_MIN_GAP_MS) {
+          junctionLatched = true;
+          lastJunctionMs = now;
+          stationsPassed++;
+          int want = 4 - stationTarget();               // station 3 -> 1st, station 1 -> 3rd
+          char msg[24];
+          snprintf(msg, sizeof(msg), "Station pass %d of %d", stationsPassed, want);
+          setStatus(msg);
+          if (stationsPassed >= want) {
+            turnDir = 1;
+            turnFwdMs = TURN_FORWARD_MS;
+            turnNext = PH_TO_STATION_END;
+            turnNextSide = 0;
+            setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
+            enterPhase(PH_TURN_FORWARD);
+            return;
+          }
+        }
+        if (!rightBranch) junctionLatched = false;
+      }
+      followLine(ir, false);
+      break;
+    }
+
+    case PH_TO_STATION_END:
+      if (ir.active >= 4) {
+        setMotors(0, 0);
+        gripperClosed = false;
+        applyGripper();
+        haveBall = false;
+        char msg[24];
+        snprintf(msg, sizeof(msg), "Placed at station %d", stationTarget());
+        setStatus(msg);
+        enterPhase(PH_GRAB);
+      } else {
+        followLine(ir, false);
+      }
+      break;
+
+    case PH_TO_BASE:
+      // After one corner the next all-black is the base box edge
+      if (ir.active == 5 && pivotDir == 0) {
+        char msg[24];
+        if (legCorners >= 1) { snprintf(msg, sizeof(msg), "DONE base %d", baseTarget()); endAutoRun(msg); }
+        else endAutoRun("Stopped: all black");
+        return;
+      }
+      followLine(ir, false);
       break;
 
     default:
@@ -701,7 +1051,7 @@ class RxCallbacks : public BLECharacteristicCallbacks {
           case '1': reqManual = true; return;
           case '2': reqAuto = true; return;
           case '3': reqGripperToggle = true; return;
-          case '4': reqCycleTarget = true; return;
+          case '4': reqCycleMode = true; return;
         }
       }
 
@@ -729,6 +1079,7 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 //   F B L R S        drive forward/back/left/right/stop (manual)
 //   A / M / G        start auto run / manual / toggle gripper
 //   force <0-3>      target override (0 = use colour)
+//   adv <b> <s> <h>  advanced: force ball, station, base (0 0 0 = use cards)
 //   set <name> <v>   change a tuning value, e.g. "set kp 45"
 //   get              list all tuning values  ("P,name=value,...")
 //   tel on|off|<hz>  telemetry stream, default 20 Hz
@@ -736,7 +1087,16 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 //
 // Telemetry line (one per period):
 //   T,ms,phase,ir,err,pid,L,R,branches,target,see,locked,C
-//   phase: 0 manual/idle 1 to-branch 2 turn-fwd 3 turn-spin 4 to-ball
+//   phase: see enum AutoPhase (0 idle, 1 to-branch ... 9 to-base)
+//
+// Colour calibration (tools/calibrate_color.py):
+//   craw on|off        stream raw colour readings: K,ms,c,r%,g%,b%,class,dist
+//   cref               list the colour references: R,label,r,g,b
+//   cref <label> r g b change one reference live (RED GREEN BLUE WHITE BLACK)
+// Start an advanced run part-way (targets from "adv b s h"):
+//   auto ball          robot on a ball branch facing the end bar
+//   auto station       robot on the vertical line heading north, below station 3, ball held
+//   auto stend         robot on a station branch facing the end bar, ball held
 //   ir: 5 bits left->right (1 = black)   see/locked: N R G B   C: clear count
 char colorChar(CardColor c) {
   switch (c) { case COLOR_RED: return 'R'; case COLOR_GREEN: return 'G'; case COLOR_BLUE: return 'B'; default: return 'N'; }
@@ -767,6 +1127,24 @@ bool setParam(const char* name, const char* value) {
     return true;
   }
   return false;
+}
+
+void sendColorRaw(const ColorReading& rd) {
+  if (!colorRawOn) return;
+  char line[64];
+  const char* label = rd.refIndex >= 0 ? COLOR_REFS[rd.refIndex].label : "-";
+  snprintf(line, sizeof(line), "K,%lu,%u,%.1f,%.1f,%.1f,%s,%.1f",
+           (unsigned long)millis(), rd.c, rd.rp, rd.gp, rd.bp, label, rd.distance);
+  bleSend(line);
+}
+
+void sendColorRefs() {
+  char line[48];
+  for (int i = 0; i < NUM_COLOR_REFS; i++) {
+    snprintf(line, sizeof(line), "R,%s,%.1f,%.1f,%.1f", COLOR_REFS[i].label,
+             COLOR_REFS[i].r, COLOR_REFS[i].g, COLOR_REFS[i].b);
+    bleSend(line);
+  }
 }
 
 void sendTelemetry() {
@@ -803,6 +1181,8 @@ void handleTextCommand(char* cmd) {
   if (!word) return;
   char* arg1 = strtok(nullptr, " ");
   char* arg2 = strtok(nullptr, " ");
+  char* arg3 = strtok(nullptr, " ");
+  char* arg4 = strtok(nullptr, " ");
 
   if (!strcasecmp(word, "ping")) {
     setStatus("pong");
@@ -825,10 +1205,36 @@ void handleTextCommand(char* cmd) {
     else { servoWriteAngle(atoi(arg1)); displayDirty = true; }
     snprintf(msg, sizeof(msg), "grip %s", arg1);
     setStatus(msg);
+  } else if (!strcasecmp(word, "adv") && arg1) {
+    targetOverride = constrain(atoi(arg1), 0, 3);
+    stationOverride = arg2 ? constrain(atoi(arg2), 0, 3) : 0;
+    baseOverride = arg3 ? constrain(atoi(arg3), 0, 2) : 0;
+    snprintf(msg, sizeof(msg), "adv ball %d stn %d base %d", targetOverride, stationOverride, baseOverride);
+    setStatus(msg);
+    displayDirty = true;
   } else if (!strcasecmp(word, "force") && arg1) {
     targetOverride = constrain(atoi(arg1), 0, 3);
     snprintf(msg, sizeof(msg), "force target %d", targetOverride);
     setStatus(msg);
+  } else if (!strcasecmp(word, "craw")) {
+    colorRawOn = !arg1 || !strcasecmp(arg1, "on");
+    setStatus(colorRawOn ? "colour raw on" : "colour raw off");
+  } else if (!strcasecmp(word, "cref")) {
+    if (arg1 && arg2 && arg3 && arg4) {
+      bool found = false;
+      for (int i = 0; i < NUM_COLOR_REFS; i++) {
+        if (strcasecmp(COLOR_REFS[i].label, arg1) != 0) continue;
+        COLOR_REFS[i].r = atof(arg2);
+        COLOR_REFS[i].g = atof(arg3);
+        COLOR_REFS[i].b = atof(arg4);
+        found = true;
+      }
+      snprintf(msg, sizeof(msg), found ? "cref %s set" : "cref: no %s", arg1);
+      setStatus(msg);
+    }
+    sendColorRefs();
+  } else if (!strcasecmp(word, "auto") && arg1) {
+    startAutoAt(arg1);
   } else if (!strcasecmp(word, "tel")) {
     if (!arg1 || !strcasecmp(arg1, "on")) telemetryOn = true;
     else if (!strcasecmp(arg1, "off")) telemetryOn = false;
@@ -873,11 +1279,13 @@ void handleRequests() {
     gripperClosed = !gripperClosed;
     applyGripper();
   }
-  if (reqCycleTarget) {
-    reqCycleTarget = false;
+  if (reqCycleMode) {
+    reqCycleMode = false;
     if (mode == MODE_MANUAL) {
-      targetOverride = (targetOverride + 1) % 4;
-      setStatus(targetOverride ? "Target forced" : "Target from colour");
+      RUN_MODE = (RUN_MODE + 1) % 3;
+      char msg[24];
+      snprintf(msg, sizeof(msg), "Mode %d %s", RUN_MODE, modeName());
+      setStatus(msg);
     }
   }
   if (deviceConnected != lastShownConnected) {
@@ -904,7 +1312,7 @@ void setup() {
   }
 
   colorSensorOk = colorSensorBegin() != 0;
-  Serial.println(colorSensorOk ? "TCS34725 OK" : "TCS34725 NOT FOUND (use button 4 to force a target)");
+  Serial.println(colorSensorOk ? "TCS34725 OK" : "TCS34725 NOT FOUND (use force / adv to set targets)");
 
   ledcSetup(PWM_CH_LEFT, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
   ledcAttachPin(ENA, PWM_CH_LEFT);
