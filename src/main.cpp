@@ -50,7 +50,15 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 const int ENA = 4, IN1 = 5, IN2 = 6;     // left motor
 const int IN3 = 7, IN4 = 15, ENB = 16;   // right motor
 
-// 5-channel IR array, left -> right (1 = black)
+// 5-channel IR array, left -> right (1 = black), sensors 23 mm apart.
+// The board is shifted to the robot's LEFT so the 19 mm line fits in the gap
+// between IR3 and IR4 (both white when centred). As built the gap is still
+// 5-10 mm right of the robot's centre, so the robot rides that far left of the
+// line - fine within the map's +-2 cm. Nominal positions from the gap centre:
+//   IR1 -57.5 mm  far left: only sees a ball branch (not used for steering)
+//   IR2 -34.5 mm  outer left     IR3 -11.5 mm  inner left
+//   IR4 +11.5 mm  inner right    IR5 +34.5 mm  outer right
+// Map patterns: centred 00000, right corner 00011, left branch 11100, crossbar 11111
 const int IR1 = 17, IR2 = 18, IR3 = 8, IR4 = 9, IR5 = 10;
 
 // Gripper servo
@@ -69,8 +77,9 @@ const int SERVO_PWM_FREQ = 50;
 const int SERVO_PWM_RES = 14;
 const int SERVO_MIN_US = 500;
 const int SERVO_MAX_US = 2400;
-const int GRIPPER_OPEN_ANGLE = 0;        // TUNE
-const int GRIPPER_CLOSED_ANGLE = 90;     // TUNE
+int GRIPPER_OPEN_ANGLE = 0;              // TUNE live: "set gopen <deg>" / "grip <deg>"
+int GRIPPER_CLOSED_ANGLE = 90;           // TUNE live: "set gclose <deg>"
+int AUTO_CLOSE_GRIPPER_ON_ARRIVAL = 1;    // close the gripper on ARRIVED ("set gauto 0" to disable)
 
 // ===================== Tuning =====================
 // These are variables (not const) so they can be changed live over BLE:
@@ -81,8 +90,12 @@ int MANUAL_SPEED = 200;
 // PID line following (same values as LineFollowing / DualMode)
 int   AUTO_BASE_SPEED = 155;             // TUNE
 int   CORNER_BRAKE = 35;                 // speed drop when line is on outer sensors
-int   LOST_LINE_SPIN = 125;              // pivot speed when the line is lost on a corner
-float Kp = 40.0, Ki = 0.0, Kd = 40.0;    // TUNE
+int   LOST_LINE_SPIN = 170;              // pivot speed when the line is lost on a corner (125 stalls)
+uint32_t OUTER_MEMORY_MS = 300;          // all-white this soon after an outer sensor alone = drifted out, pivot back
+uint32_t LOST_STOP_MS = 2000;            // no sensor sees black this long = off the track, stop
+uint32_t CORNER_FWD_MS = 150;            // TUNE: drive on (at fwdspd) before a corner pivot
+int      CORNER_CONFIRM_READS = 3;       // IR4+IR5 must both be black this many loops (~5 ms each) - noise filter
+float Kp = 40.0, Ki = 0.0, Kd = 40.0;    // TUNE (error is in sensor pitches: inner 0.5, outer 1.5)
 
 // Start: ignore the START box outline for this long after pressing AUTO
 uint32_t START_GRACE_MS = 700;           // TUNE
@@ -91,10 +104,18 @@ uint32_t START_GRACE_MS = 700;           // TUNE
 int      JUNCTION_CONFIRM_READS = 2;     // consecutive loops the pattern must be seen
 uint32_t JUNCTION_MIN_GAP_MS = 350;      // TUNE: min time between two branches
 
+// Map mode ("set map 0" / "set map 1"):
+//   0 = basic map: no stations, every left branch is a ball branch.
+//   1 = advanced map: the 3 station branches (on the left, heading down) come
+//       first, so branches only count after CORNERS_BEFORE_BALLS right corners.
+int      MAP_MODE = 1;                   // the track in use is the advanced map
+int      CORNERS_BEFORE_BALLS = 2;       // right corners before the ball branches
+uint32_t CORNER_MIN_GAP_MS = 1000;       // corners are >= 40 cm apart; ignore re-pivots
+
 // Turning into the branch
 int      TURN_FORWARD_SPEED = 130;
 uint32_t TURN_FORWARD_MS = 180;          // TUNE: drive on so the wheels sit over the junction
-int      TURN_SPIN_SPEED = 130;          // TUNE
+int      TURN_SPIN_SPEED = 170;          // TUNE (130 likely stalls, like lostspin 125)
 uint32_t TURN_MIN_SPIN_MS = 150;         // ignore sensors for the first part of the spin
 uint32_t TURN_TIMEOUT_MS = 2500;         // give up and go manual if the branch isn't found
 
@@ -110,9 +131,16 @@ const Param PARAMS[] = {
   {"kd",      'f', &Kd},
   {"brake",   'i', &CORNER_BRAKE},
   {"lostspin",'i', &LOST_LINE_SPIN},
+  {"outerms", 'u', &OUTER_MEMORY_MS},
+  {"loststop",'u', &LOST_STOP_MS},
+  {"cfwdms",  'u', &CORNER_FWD_MS},
+  {"cornreads",'i', &CORNER_CONFIRM_READS},
   {"grace",   'u', &START_GRACE_MS},
   {"jreads",  'i', &JUNCTION_CONFIRM_READS},
   {"jgap",    'u', &JUNCTION_MIN_GAP_MS},
+  {"map",     'i', &MAP_MODE},
+  {"corners", 'i', &CORNERS_BEFORE_BALLS},
+  {"cgap",    'u', &CORNER_MIN_GAP_MS},
   {"fwdspd",  'i', &TURN_FORWARD_SPEED},
   {"fwdms",   'u', &TURN_FORWARD_MS},
   {"turnspd", 'i', &TURN_SPIN_SPEED},
@@ -120,6 +148,9 @@ const Param PARAMS[] = {
   {"turnto",  'u', &TURN_TIMEOUT_MS},
   {"creads",  'i', &COLOR_CONFIRM_READS},
   {"manual",  'i', &MANUAL_SPEED},
+  {"gopen",   'i', &GRIPPER_OPEN_ANGLE},
+  {"gclose",  'i', &GRIPPER_CLOSED_ANGLE},
+  {"gauto",   'i', &AUTO_CLOSE_GRIPPER_ON_ARRIVAL},
 };
 const int NUM_PARAMS = sizeof(PARAMS) / sizeof(PARAMS[0]);
 
@@ -128,7 +159,6 @@ bool     telemetryOn = false;
 uint32_t telemetryPeriodMs = 50;
 
 // Behaviour switches
-const bool AUTO_CLOSE_GRIPPER_ON_ARRIVAL = false;
 const bool ABORT_AUTO_ON_DISCONNECT = true;
 
 // ===================== State =====================
@@ -160,9 +190,21 @@ uint32_t  lastTelemetryMs = 0;
 
 // Auto-run state (loop() only)
 float previousError = 0, integral = 0;
+int      lastOuterSide = 0;              // -1 / +1: an outer sensor last saw the line on that side
+uint32_t lastOuterMs = 0;
+uint32_t lastFarLeftMs = 0;              // IR1 (branch detector) last saw black
+bool     leftFeature = false;            // a branch-like line is under IR2 (cross it straight)
+uint32_t lastLineMs = 0;                 // any sensor last saw black
+int      pivotDir = 0;                   // -1 / +1 while pivoting to find a corner line
+uint32_t pivotStartMs = 0;               // corner move started (forward, then pivot)
+uint32_t pivotFwdMs = 0;                 // forward part of the current move
+bool     rightFeature = false;           // a corner strip is under IR4/IR5
+int      rightHitReads = 0, rightClearReads = 0;
+int      rightCorners = 0;               // right-corner pivots this run
+uint32_t lastCornerMs = 0;
 uint32_t autoStartMs = 0;
 uint32_t phaseStartMs = 0;
-bool spinLeftMainLine = false;
+bool spinSawBranch = false;             // IR1/IR2 saw the branch during the turn-in pivot
 
 int  junctionsPassed = 0;
 int  junctionSeenReads = 0;
@@ -353,19 +395,111 @@ void pollLiveColor() {
 // ===================== Line following =====================
 // straightThrough = true while crossing a branch we don't want: ignore the
 // branch so PID doesn't pull the robot into it.
+void resetLineMemory() {
+  lastOuterSide = 0;
+  pivotDir = 0;
+  leftFeature = false;
+  rightFeature = false;
+  rightHitReads = 0;
+  rightClearReads = 0;
+}
+
+// Start a turn: drive forward fwdMs (0 = pivot at once), then pivot toward dir
+// until an inner sensor finds the line. A right turn with a forward part is a
+// map corner and is counted.
+void startCorner(int dir, uint32_t fwdMs, uint32_t now) {
+  pivotDir = dir;
+  pivotFwdMs = fwdMs;
+  pivotStartMs = now;
+  lastOuterSide = 0;
+  if (dir == 1 && fwdMs > 0) {
+    rightCorners++;
+    lastCornerMs = now;
+    char msg[24];
+    snprintf(msg, sizeof(msg), "Corner %d", rightCorners);
+    setStatus(msg);
+  }
+  setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
+}
+
 void followLine(const IRState& ir, bool straightThrough) {
+  uint32_t now = millis();
+  int n = ir.s2 + ir.s3 + ir.s4 + ir.s5;          // steering sensors (IR1 = branch detector)
   float error;
 
+  // ---- Corner move in progress (see startCorner) ----
+  // Drive forward pivotFwdMs so the wheels sit over the corner, then pivot
+  // until an INNER sensor finds the new line. The outer sensors sweep across
+  // the corner line early in the pivot and must not end it.
+  if (pivotDir != 0) {
+    if (now - pivotStartMs < pivotFwdMs) {
+      setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
+      return;
+    }
+    if (!ir.s3 && !ir.s4) {
+      setMotors(pivotDir * LOST_LINE_SPIN, -pivotDir * LOST_LINE_SPIN);
+      return;
+    }
+    pivotDir = 0;                      // found it: back to PID below
+    lastOuterSide = 0;
+    rightFeature = false;
+    rightHitReads = 0;
+  }
+
+  // ---- Left: branch vs drift ----
+  // The 19 mm line can never cover two neighbouring sensors (23 mm apart), so
+  // a drifting line only ever lights IR2 on its own. A branch lies across the
+  // sensors: IR2 together with IR1 or IR3. Then drive straight until IR1/IR2 clear.
+  if (ir.s2 && (ir.s1 || ir.s3)) leftFeature = true;
+  if (!ir.s1 && !ir.s2) leftFeature = false;
+  if (ir.s1 || leftFeature) {
+    lastFarLeftMs = now;
+    straightThrough = true;
+  }
+
+  // ---- Right: corner vs drift ----
+  // Drifting, the line goes IR4 -> (both white) -> IR5: it can never cover IR4
+  // and IR5 together (23 mm apart, 19 mm line). A corner strip lies across the
+  // right side, so it lights IR4 AND IR5 together.
+  // It must hold for CORNER_CONFIRM_READS loops (IR5 noise), and once latched
+  // nothing cancels it until both right sensors read white again - whichever
+  // of IR4/IR5 leaves the strip first (the robot may be slightly angled).
+  bool rightHit = ir.s4 && ir.s5 && now - lastCornerMs > CORNER_MIN_GAP_MS;
+  rightHitReads = rightHit ? rightHitReads + 1 : 0;
+  if (!rightFeature && rightHitReads >= CORNER_CONFIRM_READS) rightFeature = true;
+
+  if (rightFeature) {
+    rightClearReads = (!ir.s4 && !ir.s5) ? rightClearReads + 1 : 0;
+    if (rightClearReads >= 2) {        // strip passed: turn
+      rightFeature = false;
+      rightClearReads = 0;
+      startCorner(1, CORNER_FWD_MS, now);
+      return;
+    }
+    straightThrough = true;            // hold the heading while crossing the strip
+  }
+
+  // ---- Drift memory (for the rare case the line drifts out past an edge) ----
+  if (ir.s2 && !ir.s5)      { lastOuterSide = -1; lastOuterMs = now; }
+  else if (ir.s5 && !ir.s2) { lastOuterSide = 1;  lastOuterMs = now; }
+  else if (lastOuterSide == -1 && ir.s3 && !ir.s2) lastOuterSide = 0;
+  else if (lastOuterSide == 1 && ir.s4 && !ir.s5)  lastOuterSide = 0;
+
   if (straightThrough) {
+    lastOuterSide = 0;                 // a branch / corner strip is not a drift
     error = 0;
-  } else if (ir.active == 0) {
-    // Lost the line: pivot toward where it was, or coast through dashed gaps
-    if (previousError <= -1.0) { setMotors(-LOST_LINE_SPIN, LOST_LINE_SPIN); return; }
-    if (previousError >= 1.0)  { setMotors(LOST_LINE_SPIN, -LOST_LINE_SPIN); return; }
-    error = previousError;
+  } else if (n == 0) {
+    // All white: centred between IR3 and IR4, a dashed gap, or lost.
+    // Pivot in place only if an outer sensor just lost the line (drifted out).
+    if (lastOuterSide != 0 && now - lastOuterMs <= OUTER_MEMORY_MS &&
+        now - lastFarLeftMs > OUTER_MEMORY_MS) {
+      startCorner(lastOuterSide, 0, now);
+      return;
+    }
+    error = 0;
   } else {
-    float sum = ir.s1 * -2.0f + ir.s2 * -1.0f + ir.s4 * 1.0f + ir.s5 * 2.0f;
-    error = sum / ir.active;
+    float sum = ir.s2 * -1.5f + ir.s3 * -0.5f + ir.s4 * 0.5f + ir.s5 * 1.5f;
+    error = sum / n;
   }
 
   integral = constrain(integral + error, -50.0f, 50.0f);
@@ -392,6 +526,10 @@ void startAutoRun() {
   mode = MODE_AUTO;
   previousError = 0;
   integral = 0;
+  resetLineMemory();
+  rightCorners = 0;
+  lastCornerMs = 0;
+  lastLineMs = millis();
   junctionsPassed = 0;
   junctionSeenReads = 0;
   junctionLatched = false;
@@ -401,6 +539,7 @@ void startAutoRun() {
   colorCandidateReads = 0;
   autoStartMs = millis();
   enterPhase(PH_TO_BRANCH);
+  setStatus(MAP_MODE ? "AUTO: advanced map" : "AUTO: basic map");
   setStatus(targetOverride ? "AUTO (forced target)" : "AUTO: reading colour");
   sendParams();                        // log the settings used for this run
 }
@@ -419,26 +558,41 @@ void autoStep() {
   IRState ir = readIR();
   uint32_t now = millis();
 
+  // Safety: centred on a straight is also all-white, but never for this long
+  if (ir.active > 0) lastLineMs = now;
+  if ((phase == PH_TO_BRANCH || phase == PH_TO_BALL) && now - lastLineMs > LOST_STOP_MS) {
+    endAutoRun("Line lost");
+    return;
+  }
+
   if (phase == PH_TO_BRANCH) pollColor();
 
   switch (phase) {
     case PH_TO_BRANCH: {
       // Leaving the START box: its outline looks like an all-black crossing
       if (now - autoStartMs < START_GRACE_MS) {
-        if (ir.active >= 4 || ir.active == 0) setMotors(AUTO_BASE_SPEED, AUTO_BASE_SPEED);
+        // No pivots here: the box edge crossing the outer sensors at an angle
+        // looks like a corner. Steer on the inner sensors only, else go straight.
+        int n = ir.s2 + ir.s3 + ir.s4 + ir.s5;
+        if (ir.active >= 4 || n == 0) setMotors(AUTO_BASE_SPEED, AUTO_BASE_SPEED);
         else followLine(ir, false);
+        resetLineMemory();
         return;
       }
 
-      if (ir.active >= 4) { endAutoRun("Stopped: all black"); return; }
+      // Only the T crossbar / a box edge covers all five; corners and branches never do
+      if (ir.active == 5) { endAutoRun("Stopped: all black"); return; }
 
-      // Ball branch: line under the left sensors AND the centre, nothing far right.
-      // Corners on this route are right turns, so they never match.
-      bool leftBranch = ir.s1 && ir.s2 && (ir.s3 || ir.s4) && !ir.s5;
+      // Ball branch: far-left IR1 and outer-left IR2 black, outer-right IR5 white.
+      // The 19 mm line can't cover IR1 and IR2 (23 mm apart) except on a branch,
+      // and corners on this route are right turns (00011), so they never match.
+      bool leftBranch = ir.s1 && ir.s2 && !ir.s5;
       junctionSeenReads = leftBranch ? junctionSeenReads + 1 : 0;
+      // Before the ball section (station branches): cross straight, don't count
+      bool countBranches = MAP_MODE == 0 || rightCorners >= CORNERS_BEFORE_BALLS;
 
       if (leftBranch) {
-        if (!junctionLatched && junctionSeenReads >= JUNCTION_CONFIRM_READS &&
+        if (countBranches && !junctionLatched && junctionSeenReads >= JUNCTION_CONFIRM_READS &&
             now - lastJunctionMs > JUNCTION_MIN_GAP_MS) {
           junctionLatched = true;
           lastJunctionMs = now;
@@ -469,7 +623,7 @@ void autoStep() {
     case PH_TURN_FORWARD:
       setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
       if (now - phaseStartMs >= TURN_FORWARD_MS) {
-        spinLeftMainLine = false;
+        spinSawBranch = false;
         enterPhase(PH_TURN_SPIN);
       }
       break;
@@ -477,10 +631,14 @@ void autoStep() {
     case PH_TURN_SPIN: {
       setMotors(-TURN_SPIN_SPEED, TURN_SPIN_SPEED);   // pivot left
       uint32_t t = now - phaseStartMs;
-      if (!ir.s3) spinLeftMainLine = true;
-      if (t >= TURN_MIN_SPIN_MS && spinLeftMainLine && ir.s3) {
+      // The branch sweeps in from the LEFT (IR1/IR2 first, then IR3). The main
+      // line moves right in a left pivot, so IR3 alone (no IR1/IR2 before it)
+      // is still the main line - accepting it drove the robot on to base 2.
+      if (ir.s1 || ir.s2) spinSawBranch = true;
+      if (t >= TURN_MIN_SPIN_MS && spinSawBranch && ir.s3) {
         previousError = 0;
         integral = 0;
+        resetLineMemory();
         setMotors(0, 0);
         enterPhase(PH_TO_BALL);
         setStatus("On branch");
@@ -654,8 +812,19 @@ void handleTextCommand(char* cmd) {
   } else if (!strcasecmp(word, "get")) {
     sendParams();
   } else if (!strcasecmp(word, "set") && arg1 && arg2) {
-    if (setParam(arg1, arg2)) { snprintf(msg, sizeof(msg), "set %s=%s", arg1, arg2); setStatus(msg); }
+    if (setParam(arg1, arg2)) {
+      snprintf(msg, sizeof(msg), "set %s=%s", arg1, arg2);
+      setStatus(msg);
+      if (!strncasecmp(arg1, "gopen", 5) || !strncasecmp(arg1, "gclose", 6)) applyGripper();  // show it
+    }
     else { snprintf(msg, sizeof(msg), "unknown param %s", arg1); setStatus(msg); }
+  } else if (!strcasecmp(word, "grip") && arg1) {
+    // grip open | grip close | grip <deg> (raw angle, for finding gopen/gclose)
+    if (!strcasecmp(arg1, "open"))       { gripperClosed = false; applyGripper(); }
+    else if (!strcasecmp(arg1, "close")) { gripperClosed = true;  applyGripper(); }
+    else { servoWriteAngle(atoi(arg1)); displayDirty = true; }
+    snprintf(msg, sizeof(msg), "grip %s", arg1);
+    setStatus(msg);
   } else if (!strcasecmp(word, "force") && arg1) {
     targetOverride = constrain(atoi(arg1), 0, 3);
     snprintf(msg, sizeof(msg), "force target %d", targetOverride);
@@ -771,6 +940,7 @@ void loop() {
     autoStep();
   } else {
     setMotors(manualLeft, manualRight);
+    readIR();                 // keep telemetry's IR bits live while idle
     pollLiveColor();
   }
 
