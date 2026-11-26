@@ -8,6 +8,12 @@ The gripper holds a ball at 0° / 90° and closes on arrival by default (`gauto 
 The **advanced task (mode 2)** and the button-4 run-mode switch are written and build, but are **not tested on the
 track yet** (tests 12–16). Colour cards are not tested yet either (no colour paper). See [Next steps](#10-next-steps).
 
+**Update (2026-11-26 evening, 4-cell battery):** the pack went from 3 to 4 cells, so the robot was retuned
+(see the lab session notes in section 8 and the new defaults in section 5). On the paper map: `force 1` reached
+ball 1; `force 2` reached ball 2 in 2 of ~9 runs. Most failures came from the **IR bar sitting too low and
+catching on the uneven paper**, not from the settings. Next session: raise the bar (~5 mm), re-adjust the IR
+knobs, test on our own flat map.
+
 ---
 
 ## 1. Hardware facts that matter for testing
@@ -167,24 +173,31 @@ Live values are lost on reset. Copy good values into the tuning block at the top
 
 | Name | Default | What it does |
 |---|---|---|
-| `speed` | 155 | base driving PWM (~21 cm/s on paper) |
-| `kp` / `ki` / `kd` | 40 / 0 / 40 | PID on the sensor error |
+| `vscale` | 95 | every motor command × this % (4-cell pack; 75/85 too weak to start, 100 too fast); telemetry shows unscaled values |
+| `ltrim` | 0 | + boosts the left motor by %, − the right one (no steady pull found, so 0) |
+| `kick` / `kickms` | 160 / 300 | leave the START box at this PWM for this long (motors need more to start than to roll) |
+| `speed` | 145 | base driving PWM after the kick (155 too fast on 4 cells, 145 alone can't start) |
+| `kp` / `ki` / `kd` | 50 / 0 / 70 | PID on the sensor error (`ki 3` winds up → robot circles) |
 | `brake` | 35 | speed drop when an edge sensor sees the line |
-| `lostspin` | 170 | pivot PWM at corners / drift-out (≤125 stalls) |
-| `outerms` | 300 | all-white this soon after an edge sensor alone = drifted out → pivot back |
+| `lostspin` | 158 | pivot PWM at corners / drift-out (4 cells: 145 too weak, 170 overshoots corner 1) |
+| `pbrake` | 40 | ms of counter-spin when a pivot finds the line (stops the overshoot; 0 = off) |
+| `psettle` | 300 | no branch detection this long after a pivot (an overshoot onto IR1/IR2 is not a branch) |
+| `outerms` | 120 | all-white this soon after an edge sensor alone = drifted out → pivot back |
 | `loststop` | 2000 | no black on any sensor this long = off the track → stop (`Line lost`) |
 | `cfwdms` | 150 | drive forward this long after a corner strip before pivoting |
-| `cornreads` | 3 | IR4+IR5 must both be black this many loops (noise filter) |
+| `cornreads` | 2 | IR4+IR5 must both be black this many loops (noise filter) |
 | `grace` | 700 | ms after start where the box outline is ignored (no pivots) |
-| `jreads` / `jgap` | 2 / 350 | ball-branch confirm loops / min ms between branches |
+| `bignore` / `bhold` | 2000 / 100 | way out: `Stopped: all black` only after this long from AUTO, and only if all five stay black this long |
+| `jreads` / `jgap` | 1 / 350 | ball-branch confirm loops / min ms between branches |
 | `mode` | 1 | 0 basic task, basic map · 1 basic task, advanced map (stations skipped) · 2 advanced task |
 | `corners` / `cgap` | 2 / 1000 | right corners before ball branches / min ms between corners |
 | `fwdspd` / `fwdms` | 130 / 180 | turn-in: forward speed / time before pivoting into the branch |
-| `turnspd` / `turnmin` / `turnto` | 170 / 150 / 2500 | turn-in pivot speed / ignore sensors first ms / give up |
+| `turnspd` / `turnmin` / `turnto` | 158 / 150 / 2500 | turn-in pivot speed / ignore sensors first ms / give up |
 | `creads` | 3 | colour must match this many reads to lock |
 | `cardmax` | 3000 | clear count below this = a card (white ~4000, cards 1200–2200); 0 = off |
 | `cwhite` | 2 | white reads needed between two cards (advanced: 3 cards in a row) |
-| `grabms` | 400 | wait after the gripper closes / opens |
+| `grabms` | 400 | wait after the gripper has finished closing / opening |
+| `gstep` | 10 | gripper speed: ms per degree (90° ≈ 0.9 s; limits the servo current spike; 0 = jump) |
 | `backspd` | 135 | reverse speed back along a branch to the T |
 | `bback` / `sback` | 250 / 250 | while reversing from the ball / station, ignore the end bar for this long |
 | `tfwdms` | 220 | after reversing onto the T, drive forward this long before the 90° turn (wheels over the line) |
@@ -298,6 +311,24 @@ Timings drift with battery level and the paper surface, so any timing windows mu
 | Run ended stuck at corner 2 | robot caught on the paper map | none (map issue) |
 | `force 3`: pivoted a little, drove on to base 2, reported `ARRIVED ball 3` | turn-in ended when IR3 saw the **main** line again; base 2's box edge looks like the crossbar | turn-in ends only on IR3 **after** IR1/IR2 saw the branch during the pivot. Always check the robot is really on the branch, not just the `ARRIVED` event |
 
+### Lab session 2026-11-26 evening: 3 → 4 cell battery
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Too fast after the battery change | ~33% more voltage | `vscale` (motor %); 95 works |
+| `vscale` 75/85: wheels slow in the air, robot won't leave the box | motors need more PWM to start than to keep rolling | start `kick` 160 for 300 ms, then `speed` 145 |
+| `Stopped: all black` 0.7 s after AUTO | robot never moved; IR on the box edge read 11111 | all-black stop ignored for the first 2 s (`bignore`) and must last 100 ms (`bhold`) |
+| Overshot corner 1, then drove straight off the left | pivot momentum (stronger pack) put the line on IR1/IR2 → read as a station branch | `lostspin` 158, counter-spin brake `pbrake`, no branch detection for `psettle` after a pivot |
+| Drove off the first straight after a wobble onto IR1+IR2 | branch rule active before corner 1 | no branch guard before corner 1 (there are no branches there) |
+| Wobble/spin loops after corner 1 | `outerms` 300: every swing to the centre gap looked like "drifted out" → pivot | `outerms` 120, `kp`/`kd` 50/70 |
+| Robot circled | `ki 3`: integral wound up to a 180 PWM steer | keep `ki 0` |
+| Missed corner 2 | came in at an angle, IR4+IR5 never 3 loops in a row | `cornreads` 2 |
+| Missed ball branch 1/2 → went to ball 3 or base 2 | IR1 missed the branch when right of the line; on the old paper map branch 1 was hardly ever seen | branch also = IR2+IR3+IR4 with IR5 white, `jreads` 1; new map |
+| "Constant steering, line not moving" for 2–8 s; line vanished ~0.8 s after branch 1 | **IR bar too low, catching on the uneven paper** (not a motor imbalance) | raise the bar ~5 mm and re-adjust the IR knobs (to do) |
+| Servo too fast, big current spike | gripper jumped to the angle | servo slews 1°/`gstep` ms; `GRAB_MS` counts from the end of the move |
+
+The run logs are in `logs/20261126-17*.log` and `logs/20261126-18*.log` (not in git).
+
 ---
 
 ## 9. Ideas not built yet
@@ -319,6 +350,10 @@ Timings drift with battery level and the paper surface, so any timing windows mu
 
 ## 11. Next steps
 
+0. **Raise the IR bar (~5 mm)** so it clears the paper, re-adjust the five IR knobs with telemetry
+   (white = 0, line = 1), then rerun `force 1/2/3` on our own flat map. Flash the current source first:
+   the slow servo (`gstep`) and `jreads 1` defaults were built but **not flashed** at the end of the session.
+   If the line still vanishes into the IR4–IR5 gap, add a lost-line search (arc toward the side last seen).
 1. The gripper now closes on `ARRIVED` by default (`gauto 1`). Not yet tested with a real ball on the ring:
    check the ball ends up inside the gripper; if not, add a short reverse/forward move at the stop.
 3. Colour card runs (tests 9–10).
