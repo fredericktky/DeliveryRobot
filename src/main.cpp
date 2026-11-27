@@ -164,7 +164,7 @@ uint32_t TURN_TIMEOUT_MS = 2500;         // give up and go manual if the branch 
 
 // Colour card
 int COLOR_CONFIRM_READS = 3;             // same colour this many reads in a row = locked
-int CARD_MAX_C = 3000;                   // clear count below this = a card (white floor ~4000, cards 1200-2200); 0 = off
+int CARD_MAX_C = 2480;                   // clear count below this = a card (white floor ~4000, cards 1200-2200); 0 = off
 int CARD_WHITE_READS = 2;                // white reads between two cards (advanced: 3 cards in a row)
 
 // Advanced task

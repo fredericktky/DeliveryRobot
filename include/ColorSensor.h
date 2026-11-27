@@ -56,18 +56,18 @@ struct ColorRef { CardColor color; float r, g, b; const char* label; };
 // so a calibration can be tried without reflashing (tools/calibrate_color.py).
 static ColorRef COLOR_REFS[] = {
   //  class         r%    g%    b%    label
-  { COLOR_RED,     71.7, 16.1, 12.6, "RED"   },  // MEASURED @2cm 16x/50ms (C~1230), 26/26 reads
-  { COLOR_GREEN,   39.1, 35.6, 19.2, "GREEN" },  // MEASURED @2cm 16x/50ms (C~2155) - only ~4.6 from WHITE!
-  { COLOR_BLUE,    36.7, 35.2, 22.5, "BLUE"  },  // MEASURED @2cm 16x/50ms (C~2205) - only ~4.1 from GREEN!
-  { COLOR_NONE,    42.0, 32.1, 20.1, "WHITE" },  // floor - MEASURED @2cm 16x/50ms (C~4000)
-  { COLOR_NONE,    34.0, 34.0, 30.0, "BLACK" },  // line (also caught by MIN_CLEAR)
+  { COLOR_RED,     73.1, 18.0, 15.5, "RED"   },  // calibrated 2026-11-27 (C~1242)
+  { COLOR_GREEN,   36.2, 44.0, 18.2, "GREEN" },  // calibrated 2026-11-27 (C~1228)
+  { COLOR_BLUE,    34.0, 37.1, 27.0, "BLUE"  },  // calibrated 2026-11-27 (C~2423)
+  { COLOR_NONE,    38.4, 34.4, 24.7, "WHITE" },  // calibrated 2026-11-27 (C~2534)
+  { COLOR_NONE,    36.7, 36.4, 28.4, "BLACK" },  // calibrated 2026-11-27 (C~1126)
 };
 static const int NUM_COLOR_REFS = sizeof(COLOR_REFS) / sizeof(COLOR_REFS[0]);
 
 // Readings with a clear value below this are treated as "too dark" (black line / nothing)
 #define COLOR_MIN_CLEAR     150
 // If the best match is further than this (in % units), treat as unknown
-#define COLOR_MAX_DISTANCE  12.0f
+#define COLOR_MAX_DISTANCE  3.0f
 static float colorMaxDistance = COLOR_MAX_DISTANCE;   // live: "set cdist <v>" in DeliveryRobot
 
 // ---------------- Data ----------------
