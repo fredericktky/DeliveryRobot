@@ -16,6 +16,7 @@ import sys
 PHASES = {
     0: "idle", 1: "to-branch", 2: "turn-fwd", 3: "turn-spin", 4: "to-ball",
     5: "grab", 6: "back-to-T", 7: "to-station", 8: "station-branch", 9: "to-base",
+    10: "pid-test", 11: "loop-test",
 }
 
 

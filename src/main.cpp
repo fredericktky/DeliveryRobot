@@ -61,6 +61,10 @@ const int IN3 = 7, IN4 = 15, ENB = 16;   // right motor
 //   IR2 -34.5 mm  outer left     IR3 -11.5 mm  inner left
 //   IR4 +11.5 mm  inner right    IR5 +34.5 mm  outer right
 // Map patterns: centred 00000, right corner 00011, left branch 11100, crossbar 11111
+// Geometry (measured): wheel track 13 cm (centre to centre); the IR bar is 8 cm
+// AHEAD of the wheel axle. So a feature under the sensors reaches the wheels
+// 8 cm later (cfwdms / fwdms cover that), and an in-place pivot swings the bar
+// on an 8 cm radius.
 const int IR1 = 17, IR2 = 18, IR3 = 8, IR4 = 9, IR5 = 10;
 
 // Gripper servo
@@ -99,18 +103,19 @@ int MOTOR_SCALE_PCT = 95;                // TUNE: 4-cell pack (75/85 too weak to
 
 // PID line following (same values as LineFollowing / DualMode)
 int   AUTO_BASE_SPEED = 145;             // TUNE (4-cell: 155 too fast; needs the start kick)
-int   CORNER_BRAKE = 35;                 // speed drop when line is on outer sensors
+int   CORNER_BRAKE = 0;                  // speed drop when line is on outer sensors (35 left the inside wheel too weak after corners)
 int   LOST_LINE_SPIN = 158;              // pivot speed (4-cell: 145 too weak, 170 overshoots corner 1)
 uint32_t OUTER_MEMORY_MS = 120;          // all-white this soon after an outer sensor alone = drifted out, pivot back (300 spun repeatedly)
 uint32_t LOST_STOP_MS = 2000;            // no sensor sees black this long = off the track, stop
-uint32_t PIVOT_BRAKE_MS = 40;            // TUNE: counter-spin when a pivot finds the line (0 = off)
+uint32_t PIVOT_BRAKE_MS = 80;            // TUNE: counter-spin when a pivot finds the line (0 = off); 40 overturned corner 1 on the real map
 uint32_t PIVOT_SETTLE_MS = 300;          // TUNE: no branch detection this long after a pivot
 uint32_t CORNER_FWD_MS = 150;            // TUNE: drive on (at fwdspd) before a corner pivot
-int      CORNER_CONFIRM_READS = 2;       // IR4+IR5 black this many loops (~5 ms each); 3 missed corner 2 at an angle
-float Kp = 50.0, Ki = 0.0, Kd = 70.0;    // TUNE (error in sensor pitches: inner 0.5, outer 1.5); ki 3 winds up
+int      CORNER_CONFIRM_READS = 1;       // IR4+IR5 black this many loops (~5 ms each); 2 missed angled corners on the square
+float Kp = 30.0, Ki = 0.0, Kd = 40.0;    // TUNE (error in sensor pitches: inner 0.5, outer 1.5). Square/straight
+                                         // tests 2026-11-27: 50/70 bounced +-25, 25/35 slower; ki (even 0.2) grows the swings
 
 // Start: ignore the START box outline for this long after pressing AUTO
-uint32_t START_GRACE_MS = 700;           // TUNE
+uint32_t START_GRACE_MS = 1000;          // TUNE (700: the box outline set off drift pivots)
 // Start kick: the motors need more PWM to start from rest than to keep rolling,
 // so leave the START box at KICK_SPEED for KICK_MS, then drop to "speed".
 int      KICK_SPEED = 160;               // TUNE
@@ -132,6 +137,22 @@ uint32_t JUNCTION_MIN_GAP_MS = 350;      // TUNE: min time between two branches
 //   2 = ADVANCED task (advanced map).
 int      RUN_MODE = 1;
 int      CORNERS_BEFORE_BALLS = 2;       // right corners before the ball branches
+// Corner = STOP, CREEP, PIVOT (cstopms > 0): on the corner strip stop for
+// cstopms, creep forward ccreepms at ccreepspd so the wheels (8 cm behind the
+// IR bar) reach the corner, then pivot until IR3/IR4 finds the new line.
+// Doesn't wait for the strip to clear, so an angled approach can't run it off.
+// cstopms 0 = old behaviour: hold straight until the strip clears, cfwdms, pivot.
+uint32_t CORNER_STOP_MS = 120;           // TUNE
+uint32_t CORNER_CREEP_MS = 250;          // TUNE: longer if it cuts inside the corner, shorter if it swings wide
+int      CORNER_CREEP_SPEED = 150;       // TUNE: must start from rest (130 may stall)
+uint32_t PIVOT_MIN_MS = 120;             // TUNE: a corner pivot turns at least this long before the line can end it
+                                         // (the creep can leave IR3/IR4 on the corner tape; 0 = off)
+uint32_t WHITE_STEER_MS = 150;           // TUNE: all white this long = steer gently (+-0.5) toward the side the
+                                         // line was LAST seen on, instead of straight (0 = off)
+uint32_t GAP_MS = 0;                     // TUNE: all-white this long after IR3/IR4 = line hidden in an outer gap (0 = off;
+                                         // 80 helped on the straight but a wrong guess could steer it off the square)
+uint32_t CORNER_MAX_MS = 250;            // old behaviour only: strip never clears this long = pivot anyway
+int      LOOP_CORNERS = 8;               // "auto loop" stops after this many corners (4 = one lap)
 uint32_t CORNER_MIN_GAP_MS = 1000;       // corners are >= 40 cm apart; ignore re-pivots
 
 // Turning into the branch
@@ -190,6 +211,14 @@ const Param PARAMS[] = {
   {"mode",    'i', &RUN_MODE},
   {"corners", 'i', &CORNERS_BEFORE_BALLS},
   {"cgap",    'u', &CORNER_MIN_GAP_MS},
+  {"loopc",   'i', &LOOP_CORNERS},
+  {"cmaxms",  'u', &CORNER_MAX_MS},
+  {"gapms",   'u', &GAP_MS},
+  {"wsteer",  'u', &WHITE_STEER_MS},
+  {"pivmin",  'u', &PIVOT_MIN_MS},
+  {"cstopms", 'u', &CORNER_STOP_MS},
+  {"ccreepms",'u', &CORNER_CREEP_MS},
+  {"ccreepspd",'i', &CORNER_CREEP_SPEED},
   {"fwdspd",  'i', &TURN_FORWARD_SPEED},
   {"fwdms",   'u', &TURN_FORWARD_MS},
   {"turnspd", 'i', &TURN_SPIN_SPEED},
@@ -237,7 +266,9 @@ enum AutoPhase {
   PH_BACKUP,          // 6 advanced: reverse straight back to the T, then 90 deg turn (phases 2-3)
   PH_TO_STATION,      // 7 advanced: bottom line east, left corner, count stations
   PH_TO_STATION_END,  // 8 advanced: follow the station branch to its end bar
-  PH_TO_BASE          // 9 advanced: to base 1 or 2, stop on the box edge
+  PH_TO_BASE,         // 9 advanced: to base 1 or 2, stop on the box edge
+  PH_PID_TEST,        // 10 "auto pid": PID only (no corners/branches/cards), for a test track
+  PH_LOOP_TEST        // 11 "auto loop": square test loop, corners + branches, no cards
 };
 
 RobotMode mode = MODE_MANUAL;
@@ -258,6 +289,16 @@ volatile bool cmdPending = false;
 // Last values, for telemetry
 int   lastLeftCmd = 0, lastRightCmd = 0;
 float lastError = 0, lastPid = 0;
+// Line position estimate (sensor pitches). The 19 mm line fits in EVERY 23 mm
+// gap, so all-white is either centred (IR3-IR4 gap) or hidden in the IR2-IR3 /
+// IR4-IR5 gap. Which one follows from the direction the line was moving when it
+// left IR3 / IR4: centre -> IR3 -> white = IR2-IR3 gap (-1.0); IR2 -> IR3 ->
+// white = centred again (0).
+// Only after the white has lasted GAP_MS: a quick swing back through the centre
+// takes ~30 ms and must not count. GAP_MS 0 = estimate off (all-white = centred).
+float lineEst = 0, linePrevEst = 0;
+float    lastSeenErr = 0;                // error the last time a steering sensor saw the line
+uint32_t lineWhiteSinceMs = 0;           // all-white started (0 = a sensor sees the line)
 int   lastIrBits = 0;
 uint16_t  lastColorC = 0;
 CardColor lastColorClass = COLOR_NONE;
@@ -274,6 +315,11 @@ uint32_t lastLineMs = 0;                 // any sensor last saw black
 int      pivotDir = 0;                   // -1 / +1 while pivoting to find a corner line
 uint32_t pivotStartMs = 0;               // corner move started (forward, then pivot)
 uint32_t pivotEndMs = 0;                 // last pivot found its line (settle window starts)
+uint32_t cornerLatchMs = 0;              // when the corner strip was latched
+uint32_t pivotStopMs = 0;                // stop part of the current move (before the forward part)
+int      pivotFwdSpeed = 0;              // forward speed of the current move
+bool     pivotIsCorner = false;          // the current pivot is a counted corner (pivmin applies)
+bool     cornerArmed = true;             // corner-side outer sensor read white since the last corner
 uint32_t brakeUntilMs = 0;               // counter-spin brake after a pivot runs until then
 int      brakeDir = 0;
 uint32_t pivotFwdMs = 0;                 // forward part of the current move
@@ -579,6 +625,11 @@ void pollLiveColor() {
 // is a branch (cross it straight). Outbound: corners right, branches left.
 // straightThrough = true forces straight driving (e.g. crossing a ball branch).
 void resetLineMemory() {
+  lastSeenErr = 0;
+  lineWhiteSinceMs = 0;
+  cornerArmed = true;
+  lineEst = 0;
+  linePrevEst = 0;
   lastOuterSide = 0;
   pivotDir = 0;
   branchFeature = false;
@@ -587,21 +638,29 @@ void resetLineMemory() {
   cornerClearReads = 0;
 }
 
-// Start a turn: drive forward fwdMs (0 = pivot at once), then pivot toward dir
-// until an inner sensor finds the line. count = a map corner (logged, counted).
-void startCorner(int dir, uint32_t fwdMs, uint32_t now, bool count) {
+// Start a turn: stop stopMs, drive forward fwdMs at fwdSpeed (0 = pivot at
+// once), then pivot toward dir until an inner sensor finds the line.
+// count = a map corner (logged, counted).
+void startCorner(int dir, uint32_t fwdMs, uint32_t now, bool count,
+                 uint32_t stopMs = 0, int fwdSpeed = -1) {
   pivotDir = dir;
   pivotFwdMs = fwdMs;
+  pivotStopMs = stopMs;
+  pivotIsCorner = count;
+  pivotFwdSpeed = fwdSpeed < 0 ? TURN_FORWARD_SPEED : fwdSpeed;
   pivotStartMs = now;
   lastOuterSide = 0;
-  lastCornerMs = now;
   if (count) {
+    cornerArmed = false;               // re-armed once the corner-side outer sensor reads white
+    lastCornerMs = now;                // only a real corner blocks the next one (cgap);
+                                       // a drift-out pivot must not, or the next corner is missed
     legCorners++;
     char msg[24];
     snprintf(msg, sizeof(msg), "Corner %d %s", legCorners, dir > 0 ? "R" : "L");
     setStatus(msg);
   }
-  setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
+  if (stopMs > 0) setMotors(0, 0);
+  else setMotors(pivotFwdSpeed, pivotFwdSpeed);
 }
 
 void followLine(const IRState& ir, bool straightThrough) {
@@ -618,11 +677,17 @@ void followLine(const IRState& ir, bool straightThrough) {
     return;
   }
   if (pivotDir != 0) {
-    if (now - pivotStartMs < pivotFwdMs) {
-      setMotors(TURN_FORWARD_SPEED, TURN_FORWARD_SPEED);
+    if (now - pivotStartMs < pivotStopMs) {
+      setMotors(0, 0);
       return;
     }
-    if (!ir.s3 && !ir.s4) {
+    if (now - pivotStartMs < pivotStopMs + pivotFwdMs) {
+      setMotors(pivotFwdSpeed, pivotFwdSpeed);
+      return;
+    }
+    bool tooEarly = pivotIsCorner &&
+                    now - pivotStartMs < pivotStopMs + pivotFwdMs + PIVOT_MIN_MS;
+    if (tooEarly || (!ir.s3 && !ir.s4)) {
       setMotors(pivotDir * LOST_LINE_SPIN, -pivotDir * LOST_LINE_SPIN);
       return;
     }
@@ -631,6 +696,9 @@ void followLine(const IRState& ir, bool straightThrough) {
     pivotEndMs = now;
     pivotDir = 0;                      // found it: brake, then back to PID below
     lastOuterSide = 0;
+    lineEst = 0;                       // fresh estimate on the new line
+    lastSeenErr = 0;
+    linePrevEst = 0;
     cornerFeature = false;
     cornerHitReads = 0;
   }
@@ -638,7 +706,8 @@ void followLine(const IRState& ir, bool straightThrough) {
   if (cornerSide != 0) {
     bool leftHit  = ir.s2 && (ir.s1 || ir.s3);
     bool rightHit = ir.s4 && ir.s5;
-    bool cornerHit   = cornerSide > 0 ? rightHit : leftHit;
+    // A corner strip never reaches the branch side: both sides black = a branch / crossbar
+    bool cornerHit   = cornerSide > 0 ? (rightHit && !ir.s1 && !ir.s2) : (leftHit && !ir.s4 && !ir.s5);
     bool branchHit   = cornerSide > 0 ? (leftHit || ir.s1) : rightHit;   // IR1 only ever sees a branch
     bool cornerClear = cornerSide > 0 ? (!ir.s4 && !ir.s5) : (!ir.s1 && !ir.s2);
     bool branchClear = cornerSide > 0 ? (!ir.s1 && !ir.s2) : (!ir.s4 && !ir.s5);
@@ -655,10 +724,33 @@ void followLine(const IRState& ir, bool straightThrough) {
     // ---- Corner side: confirm (noise filter), latch, turn when it clears ----
     // Once latched nothing cancels it until the corner-side sensors read white
     // again, whichever leaves the strip first (the robot may be slightly angled).
-    cornerHitReads = (cornerHit && now - lastCornerMs > CORNER_MIN_GAP_MS) ? cornerHitReads + 1 : 0;
-    if (!cornerFeature && cornerHitReads >= CORNER_CONFIRM_READS) cornerFeature = true;
+    // Arming: after a corner the new line may still lie across IR4+IR5 (a slightly
+    // short pivot). That must not count as the next corner, so a corner only
+    // counts once the corner-side outer sensor has read white again.
+    if (cornerSide > 0 ? !ir.s5 : !ir.s2) cornerArmed = true;
+    // To the ball branches there is no corner after the last one before the balls:
+    // IR4+IR5 there (leaving a ball branch) is not a corner.
+    bool noMoreCorners = phase == PH_TO_BRANCH && advMap() && legCorners >= CORNERS_BEFORE_BALLS;
+    cornerHitReads = (cornerHit && cornerArmed && !noMoreCorners && now - lastCornerMs > CORNER_MIN_GAP_MS) ? cornerHitReads + 1 : 0;
+    if (!cornerFeature && cornerHitReads >= CORNER_CONFIRM_READS) {
+      if (CORNER_STOP_MS > 0) {        // stop, creep onto the corner, pivot
+        cornerHitReads = 0;
+        startCorner(cornerSide, CORNER_CREEP_MS, now, true, CORNER_STOP_MS, CORNER_CREEP_SPEED);
+        return;
+      }
+      cornerFeature = true;
+      cornerLatchMs = now;
+    }
     if (cornerFeature) {
       cornerClearReads = cornerClear ? cornerClearReads + 1 : 0;
+      if (CORNER_MAX_MS > 0 && now - cornerLatchMs > CORNER_MAX_MS) {
+        // Strip never cleared (angled approach, or off the paper): pivot now,
+        // no forward drive - the robot has already rolled on past the strip.
+        cornerFeature = false;
+        cornerClearReads = 0;
+        startCorner(cornerSide, 0, now, true);
+        return;
+      }
       if (cornerClearReads >= 2) {     // strip passed: turn
         cornerFeature = false;
         cornerClearReads = 0;
@@ -675,6 +767,26 @@ void followLine(const IRState& ir, bool straightThrough) {
   else if (lastOuterSide == -1 && ir.s3 && !ir.s2) lastOuterSide = 0;
   else if (lastOuterSide == 1 && ir.s4 && !ir.s5)  lastOuterSide = 0;
 
+  // ---- Position estimate (see lineEst) ----
+  if (straightThrough) {
+    lineEst = 0;
+    linePrevEst = 0;
+    lineWhiteSinceMs = 0;
+  } else if (n > 0) {
+    lineWhiteSinceMs = 0;
+    float measured = (ir.s2 * -1.5f + ir.s3 * -0.5f + ir.s4 * 0.5f + ir.s5 * 1.5f) / n;
+    lastSeenErr = measured;
+    if (measured != lineEst) { linePrevEst = lineEst; lineEst = measured; }
+  } else if (lineWhiteSinceMs == 0) {
+    lineWhiteSinceMs = now;
+  } else if (GAP_MS > 0 && now - lineWhiteSinceMs >= GAP_MS &&
+             (lineEst == -0.5f || lineEst == 0.5f)) {
+    float moved = lineEst - linePrevEst;           // direction it reached IR3 / IR4 from
+    float next = lineEst + (moved < 0 ? -0.5f : 0.5f);
+    linePrevEst = lineEst;
+    lineEst = next;                                // -1.0 / +1.0 = hidden in an outer gap, 0 = centred
+  }
+
   if (straightThrough) {
     lastOuterSide = 0;                 // a branch / corner strip is not a drift
     error = 0;
@@ -686,7 +798,10 @@ void followLine(const IRState& ir, bool straightThrough) {
       startCorner(lastOuterSide, 0, now, false);
       return;
     }
-    error = 0;
+    if (lineEst == -1.0f || lineEst == 1.0f) error = lineEst;       // hidden in an outer gap: keep steering
+    else if (WHITE_STEER_MS > 0 && lineWhiteSinceMs != 0 && now - lineWhiteSinceMs >= WHITE_STEER_MS)
+      error = lastSeenErr > 0 ? 0.5f : (lastSeenErr < 0 ? -0.5f : 0);  // drift back toward where it was last seen
+    else error = 0;
   } else {
     float sum = ir.s2 * -1.5f + ir.s3 * -0.5f + ir.s4 * 0.5f + ir.s5 * 1.5f;
     error = sum / n;
@@ -786,6 +901,28 @@ bool startAutoAt(const char* where) {
   return true;
 }
 
+// PID test ("auto pid"): plain line following on a straight / S-curve test
+// track. No corner pivots, branch handling, colour reads or crossbar logic -
+// only the PID (plus the drift-out pivot). Start kick as usual. Ends when the
+// line is lost for loststop ms or all five sensors stay black (an end bar).
+void startPidTest() {
+  startAutoRun();
+  startLeg(PH_PID_TEST, 0);            // cornerSide 0: no corners, no branches
+  setStatus("AUTO pid test");
+}
+
+// Square test loop ("auto loop" / "auto loopl"): normal corner pivots and
+// branch crossing, but no cards, no ball-branch turn-in, no crossbar stop.
+//   loop : clockwise, corners RIGHT, branches on the LEFT (like the real outbound leg)
+//   loopl: anticlockwise, corners LEFT, branches on the RIGHT (like the station leg)
+// Branches crossed are counted in the telemetry "branches" field.
+// Ends after loopc corners, or when the line is lost for loststop ms.
+void startLoopTest(int side) {
+  startAutoRun();
+  startLeg(PH_LOOP_TEST, side);
+  setStatus(side > 0 ? "AUTO loop R" : "AUTO loop L");
+}
+
 // Stop and hand control back to the user
 void endAutoRun(const char* msg) {
   setMotors(0, 0);
@@ -817,13 +954,15 @@ void autoStep() {
   // Safety: centred on a straight is also all-white, but never for this long
   if (ir.active > 0) lastLineMs = now;
   bool following = phase == PH_TO_BRANCH || phase == PH_TO_BALL ||
-                   phase == PH_TO_STATION || phase == PH_TO_STATION_END || phase == PH_TO_BASE;
+                   phase == PH_TO_STATION || phase == PH_TO_STATION_END || phase == PH_TO_BASE ||
+                   phase == PH_PID_TEST || phase == PH_LOOP_TEST;
   if (following && now - lastLineMs > LOST_STOP_MS) {
     endAutoRun("Line lost");
     return;
   }
 
-  noBranchesYet = (phase == PH_TO_BRANCH && legCorners == 0);
+  // No branch handling before corner 1, nor on the square test loop (branches removed)
+  noBranchesYet = (phase == PH_TO_BRANCH && legCorners == 0) || phase == PH_LOOP_TEST;
   switch (phase) {
     case PH_TO_BRANCH: {
       // Leaving the START box: its outline looks like an all-black crossing
@@ -853,8 +992,11 @@ void autoStep() {
       }
 
       // Only the T crossbar / a box edge covers all five; corners and branches never do
+      // Not while a corner move (stop, creep, pivot) or its settle time is running:
+      // the robot stops ON the corner and its overlap can read all black.
       static uint32_t allBlackSinceMs = 0;
-      if (ir.active == 5) {
+      bool cornerMove = pivotDir != 0 || now < brakeUntilMs || now - pivotEndMs < PIVOT_SETTLE_MS;
+      if (ir.active == 5 && !cornerMove) {
         if (allBlackSinceMs == 0) allBlackSinceMs = now;
         if (now - autoStartMs >= ALL_BLACK_IGNORE_MS &&
             now - allBlackSinceMs >= ALL_BLACK_HOLD_MS) {
@@ -1099,6 +1241,66 @@ void autoStep() {
       followLine(ir, false);
       break;
 
+    case PH_PID_TEST: {
+      static uint32_t pidBlackSinceMs = 0;
+      if (ir.active == 5 && now - autoStartMs >= START_GRACE_MS) {
+        if (pidBlackSinceMs == 0) pidBlackSinceMs = now;
+        if (now - pidBlackSinceMs >= ALL_BLACK_HOLD_MS) {
+          pidBlackSinceMs = 0;
+          endAutoRun("PID test: end bar");
+          return;
+        }
+      } else {
+        pidBlackSinceMs = 0;
+      }
+      if (now - autoStartMs < KICK_MS) {
+        int k = max(KICK_SPEED, AUTO_BASE_SPEED);
+        setMotors(k, k);
+      } else {
+        followLine(ir, false);
+      }
+      break;
+    }
+
+    case PH_LOOP_TEST: {
+      // Stuck (wheels spinning on the paper, caught on tape): the IR pattern
+      // stays the same for 1.5 s while the line is in view. Stop instead of
+      // counting the same corner again and again.
+      static uint8_t stuckBits = 0xFF;
+      static uint32_t stuckSinceMs = 0;
+      uint8_t steerBits = lastIrBits & 0x0F;   // IR2..IR5 (IR1 is branch-only and may flicker)
+      if (steerBits != stuckBits || steerBits == 0 || now - autoStartMs < 1000) {
+        stuckBits = steerBits;
+        stuckSinceMs = now;
+      } else if (now - stuckSinceMs > 1500) {
+        stuckBits = 0xFF;
+        char msg[24];
+        snprintf(msg, sizeof(msg), "Stuck %dc %db", legCorners, junctionsPassed);
+        endAutoRun(msg);
+        return;
+      }
+      if (legCorners >= LOOP_CORNERS && pivotDir == 0 && now >= brakeUntilMs) {
+        char msg[24];
+        snprintf(msg, sizeof(msg), "Loop done %dc %db", legCorners, junctionsPassed);
+        endAutoRun(msg);
+        return;
+      }
+      if (now - autoStartMs < KICK_MS) {
+        int k = max(KICK_SPEED, AUTO_BASE_SPEED);
+        setMotors(k, k);
+        return;
+      }
+      bool wasBranch = branchFeature;
+      followLine(ir, false);
+      if (branchFeature && !wasBranch) {
+        junctionsPassed++;
+        char msg[24];
+        snprintf(msg, sizeof(msg), "Branch %d", junctionsPassed);
+        setStatus(msg);
+      }
+      break;
+    }
+
     default:
       setMotors(0, 0);
       break;
@@ -1177,7 +1379,7 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 //
 // Telemetry line (one per period):
 //   T,ms,phase,ir,err,pid,L,R,branches,target,see,locked,C
-//   phase: see enum AutoPhase (0 idle, 1 to-branch ... 9 to-base)
+//   phase: see enum AutoPhase (0 idle, 1 to-branch ... 9 to-base, 10 pid test, 11 loop test)
 //
 // Colour calibration (tools/calibrate_color.py):
 //   craw on|off        stream raw colour readings: K,ms,c,r%,g%,b%,class,dist
@@ -1187,6 +1389,10 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 //   auto ball          robot on a ball branch facing the end bar
 //   auto station       robot on the vertical line heading north, below station 3, ball held
 //   auto stend         robot on a station branch facing the end bar, ball held
+// PID tuning on a test track (any run mode):
+//   auto pid           PID line following only; stops on line lost / end bar
+//   auto loop          square loop clockwise: corners right, branches left (loopc corners)
+//   auto loopl         square loop anticlockwise: corners left, branches right
 //   ir: 5 bits left->right (1 = black)   see/locked: N R G B   C: clear count
 char colorChar(CardColor c) {
   switch (c) { case COLOR_RED: return 'R'; case COLOR_GREEN: return 'G'; case COLOR_BLUE: return 'B'; default: return 'N'; }
@@ -1324,7 +1530,10 @@ void handleTextCommand(char* cmd) {
     }
     sendColorRefs();
   } else if (!strcasecmp(word, "auto") && arg1) {
-    startAutoAt(arg1);
+    if (!strcasecmp(arg1, "pid")) startPidTest();
+    else if (!strcasecmp(arg1, "loop")) startLoopTest(1);
+    else if (!strcasecmp(arg1, "loopl")) startLoopTest(-1);
+    else startAutoAt(arg1);
   } else if (!strcasecmp(word, "tel")) {
     if (!arg1 || !strcasecmp(arg1, "on")) telemetryOn = true;
     else if (!strcasecmp(arg1, "off")) telemetryOn = false;
